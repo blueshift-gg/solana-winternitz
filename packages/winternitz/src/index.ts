@@ -4,7 +4,8 @@
 // and `tests/winternitz.key` pin the two together.
 
 import { keccak_256 } from '@noble/hashes/sha3.js';
-import { closeSync, fsyncSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { randomFillSync } from 'node:crypto';
 import { dirname } from 'node:path';
 
 /** `v`: hash-sig's 18-byte message hash at w = 4, 144 bits ≥ 138, eq. (13). */
@@ -24,10 +25,6 @@ const MAX_TRIALS = 4096;
 const ROLE_CHAIN = 0;
 const ROLE_TREE = 1;
 const ROLE_MESSAGE = 2;
-/** hash-sig `symmetric/prf/sha.rs`: `PRF_DOMAIN_SEP`, then a purpose byte for a domain element or randomness. */
-const PRF_DOMAIN_SEP = Uint8Array.of(0x00, 0x01, 0x12, 0xff, 0x00, 0x01, 0xfa, 0xff, 0x00, 0xaf, 0x12, 0xff, 0x01, 0xfa, 0xff, 0x00);
-const PRF_DOMAIN_ELEMENT = 0;
-const PRF_RANDOMNESS = 1;
 /** `l_msg`, hash-sig's `MESSAGE_LENGTH`: a message is a 32-byte digest, the caller's hash of whatever it acts on. */
 export const MESSAGE_LENGTH = 32;
 
@@ -59,12 +56,6 @@ function u32be(n: number): Uint8Array {
 function u32le(n: number): Uint8Array {
   const out = new Uint8Array(4);
   new DataView(out.buffer).setUint32(0, n, true);
-  return out;
-}
-
-function u64be(n: number): Uint8Array {
-  const out = new Uint8Array(8);
-  new DataView(out.buffer).setBigUint64(0, BigInt(n), false);
   return out;
 }
 
@@ -104,16 +95,14 @@ function node(parameter: Uint8Array, level: number, index: number, left: Uint8Ar
   return keccak_256(concat(parameter, treeTweak(level, index), left, right)).subarray(0, ELEMENT_LENGTH);
 }
 
-/**
- * Remark 7's PRF, byte for byte hash-sig's `ShaPRF`: `H(sep || purpose || key || epoch || index)` for chain
- * starts. Keyed by the seed alone, so one seed per key. `P` is sampled, not derived.
- */
-function start(seed: Uint8Array, leaf: number, i: number): Uint8Array {
-  return keccak_256(concat(PRF_DOMAIN_SEP, Uint8Array.of(PRF_DOMAIN_ELEMENT), seed, u32be(leaf), u64be(i))).subarray(0, ELEMENT_LENGTH);
+/** Explicit chain starts, in leaf-major, chain-major order. */
+function start(secrets: Uint8Array, leaf: number, i: number): Uint8Array {
+  const offset = leaf * ELEMENTS_LENGTH + i * ELEMENT_LENGTH;
+  return secrets.subarray(offset, offset + ELEMENT_LENGTH);
 }
 
-function endsOf(seed: Uint8Array, parameter: Uint8Array, leaf: number): Uint8Array[] {
-  return Array.from({ length: CHAINS }, (_, i) => walk(parameter, leaf, i, 0, POSITIONS - 1, start(seed, leaf, i)));
+function endsOf(secrets: Uint8Array, parameter: Uint8Array, leaf: number): Uint8Array[] {
+  return Array.from({ length: CHAINS }, (_, i) => walk(parameter, leaf, i, 0, POSITIONS - 1, start(secrets, leaf, i)));
 }
 
 function endsFromSignature(parameter: Uint8Array, leaf: number, x: Uint8Array, elements: Uint8Array): Uint8Array[] {
@@ -122,16 +111,12 @@ function endsFromSignature(parameter: Uint8Array, leaf: number, x: Uint8Array, e
   );
 }
 
-/** Construction 3 Sig steps 3–5, salts from hash-sig's PRF over `(leaf, m, ctr)`. */
-function signLeaf(seed: Uint8Array, parameter: Uint8Array, leaf: number, message: Uint8Array): Uint8Array {
-  for (let ctr = 0; ctr < MAX_TRIALS; ctr++) {
-    const salt = keccak_256(concat(PRF_DOMAIN_SEP, Uint8Array.of(PRF_RANDOMNESS), seed, u32be(leaf), message, u64be(ctr))).subarray(0, SALT_LENGTH);
-    const x = encode(salt, parameter, leaf, message);
-    if (!x) continue;
-    const elements = Array.from({ length: CHAINS }, (_, i) => walk(parameter, leaf, i, 0, x[i]!, start(seed, leaf, i)));
-    return concat(salt, ...elements);
-  }
-  throw new Error('no salt reached the target sum in 4096 attempts');
+/** Construction 3 Sig with an already accepted salt. */
+function signLeaf(secrets: Uint8Array, parameter: Uint8Array, leaf: number, message: Uint8Array, salt: Uint8Array): Uint8Array {
+  const x = encode(salt, parameter, leaf, message);
+  if (!x) throw new Error('salt misses the target sum');
+  const elements = Array.from({ length: CHAINS }, (_, i) => walk(parameter, leaf, i, 0, x[i]!, start(secrets, leaf, i)));
+  return concat(salt, ...elements);
 }
 
 /** `(root, P)` of Construction 3, 41 bytes. */
@@ -191,32 +176,37 @@ export namespace winternitz {
     }
   }
 
-  /** One seed, one signature; sign through `Signer`. */
+  /** Sampled chain starts, one signature; sign through `Signer`. */
   export class SecretKey {
-    readonly #seed: Uint8Array;
+    static readonly LEAVES = 1;
+    static readonly HEIGHT = HEIGHT;
+    readonly #secrets: Uint8Array;
     readonly #parameter: Uint8Array;
 
-    private constructor(seed: Uint8Array, parameter: Uint8Array) {
-      this.#seed = seed;
+    private constructor(secrets: Uint8Array, parameter: Uint8Array) {
+      this.#secrets = secrets;
       this.#parameter = parameter;
     }
 
-    /** Construction 3 Gen from the caller's sampled `seed` and `P`. */
-    static new(seed: Uint8Array | ArrayLike<number>, parameter: Uint8Array | ArrayLike<number>): SecretKey {
-      return new SecretKey(bytes(seed, 32, 'seed'), bytes(parameter, PARAMETER_LENGTH, 'parameter'));
+    /** Construction 3 Gen from independently sampled chain starts and `P`. */
+    static new(secrets: Uint8Array | ArrayLike<number>, parameter: Uint8Array | ArrayLike<number>): SecretKey {
+      return new SecretKey(bytes(secrets, SecretKey.LEAVES * ELEMENTS_LENGTH, 'chain starts'), bytes(parameter, PARAMETER_LENGTH, 'parameter'));
     }
 
+    /** Raw chain starts; never restore usage state from these alone. */
+    get secrets(): Uint8Array { return this.#secrets.slice(); }
+
     get publicKey(): PublicKey {
-      return PublicKey.from(concat(leafHash(this.#parameter, 0, endsOf(this.#seed, this.#parameter, 0)), this.#parameter));
+      return PublicKey.from(concat(leafHash(this.#parameter, 0, endsOf(this.#secrets, this.#parameter, 0)), this.#parameter));
     }
 
     readonly leaves = 1;
     readonly height = HEIGHT;
 
     /** Construction 3 Sig at the one leaf; throws at any other. Records nothing. */
-    signAt(leaf: number, message: Uint8Array): Signature {
+    signAt(leaf: number, message: Uint8Array, salt: Uint8Array): Signature {
       if (leaf !== 0) throw new RangeError('leaf: expected 0');
-      return Signature.from(signLeaf(this.#seed, this.#parameter, 0, bytes(message, MESSAGE_LENGTH, 'message')));
+      return Signature.from(signLeaf(this.#secrets, this.#parameter, 0, bytes(message, MESSAGE_LENGTH, 'message'), bytes(salt, SALT_LENGTH, 'salt')));
     }
   }
 }
@@ -268,18 +258,20 @@ export namespace xmss {
     }
   }
 
-  /** Construction 3 Gen with hash-sig's PRF, every node kept: ~148k hashes to build. */
+  /** Construction 3 Gen from sampled chain starts, every node kept: ~148k hashes to build. */
   export class SecretKey {
-    readonly #seed: Uint8Array;
+    static readonly LEAVES = LEAVES;
+    static readonly HEIGHT = HEIGHT;
+    readonly #secrets: Uint8Array;
     readonly #parameter: Uint8Array;
     /** Level-major: leaves first, root last. */
     readonly #nodes: Uint8Array[];
 
-    private constructor(seed: Uint8Array, parameter: Uint8Array) {
-      this.#seed = seed;
+    private constructor(secrets: Uint8Array, parameter: Uint8Array) {
+      this.#secrets = secrets;
       this.#parameter = parameter;
       this.#nodes = new Array(2 * LEAVES - 1);
-      for (let leaf = 0; leaf < LEAVES; leaf++) this.#nodes[leaf] = leafHash(this.#parameter, leaf, endsOf(seed, this.#parameter, leaf));
+      for (let leaf = 0; leaf < LEAVES; leaf++) this.#nodes[leaf] = leafHash(this.#parameter, leaf, endsOf(secrets, this.#parameter, leaf));
       for (let l = 1; l <= HEIGHT; l++) {
         for (let i = 0; i < LEAVES >> l; i++) {
           const child = levelOffset(l - 1) + 2 * i;
@@ -288,10 +280,13 @@ export namespace xmss {
       }
     }
 
-    /** Construction 3 Gen from the caller's sampled `seed` and `P`: every chain of every leaf, then the tree. */
-    static new(seed: Uint8Array | ArrayLike<number>, parameter: Uint8Array | ArrayLike<number>): SecretKey {
-      return new SecretKey(bytes(seed, 32, 'seed'), bytes(parameter, PARAMETER_LENGTH, 'parameter'));
+    /** Construction 3 Gen from independently sampled chain starts and `P`: every chain of every leaf, then the tree. */
+    static new(secrets: Uint8Array | ArrayLike<number>, parameter: Uint8Array | ArrayLike<number>): SecretKey {
+      return new SecretKey(bytes(secrets, SecretKey.LEAVES * ELEMENTS_LENGTH, 'chain starts'), bytes(parameter, PARAMETER_LENGTH, 'parameter'));
     }
+
+    /** Raw chain starts; never restore usage state from these alone. */
+    get secrets(): Uint8Array { return this.#secrets.slice(); }
 
     get publicKey(): PublicKey {
       return PublicKey.from(concat(this.#nodes[levelOffset(HEIGHT)]!, this.#parameter));
@@ -301,115 +296,111 @@ export namespace xmss {
     readonly height = HEIGHT;
 
     /** Construction 3 Sig plus Construction 1 Path. Records nothing; sign through `Signer`. */
-    signAt(leaf: number, message: Uint8Array): Signature {
+    signAt(leaf: number, message: Uint8Array, salt: Uint8Array): Signature {
       if (!Number.isInteger(leaf) || leaf < 0 || leaf >= LEAVES) throw new RangeError(`leaf: expected 0..${LEAVES}`);
       const path = Array.from({ length: HEIGHT }, (_, l) => this.#nodes[levelOffset(l) + ((leaf >> l) ^ 1)]!);
-      return Signature.from(concat(u32be(leaf), signLeaf(this.#seed, this.#parameter, leaf, bytes(message, MESSAGE_LENGTH, 'message')), ...path));
+      return Signature.from(concat(u32be(leaf), signLeaf(this.#secrets, this.#parameter, leaf, bytes(message, MESSAGE_LENGTH, 'message'), bytes(salt, SALT_LENGTH, 'salt')), ...path));
     }
   }
 }
 
-/** The two instances as the signer sees them: `signAt` is Sig with no one-use rule; `Signer` supplies it. */
+/** Raw operations without a one-use rule. Use `Signer`; never reuse starts across keys. */
 export interface OneTime<S> {
   readonly leaves: number;
-  /** In the key file, so a file opens only under its own instance. */
   readonly height: number;
   readonly publicKey: PublicKey;
-  signAt(leaf: number, message: Uint8Array): S;
+  readonly secrets: Uint8Array;
+  /** Never use a spent leaf with a different message or salt. */
+  signAt(leaf: number, message: Uint8Array, salt: Uint8Array): S;
 }
 
 /** `winternitz.SecretKey` or `xmss.SecretKey`. */
 export interface KeyType<S> {
-  'new'(seed: Uint8Array, parameter: Uint8Array): OneTime<S>;
+  readonly LEAVES: number;
+  readonly HEIGHT: number;
+  'new'(secrets: Uint8Array, parameter: Uint8Array): OneTime<S>;
 }
 
-// Key file: version || height || seed || P || next leaf BE || message flag || last message, 89 bytes, byte-identical to the crate's.
-const VERSION = 1;
-const SEED = 2;
-const PARAMETER = SEED + 32;
+// v2: version || height || P || next leaf BE || message flag || message || accepted salt || chain starts.
+const VERSION = 2;
+const PARAMETER = 2;
 const NEXT_LEAF = PARAMETER + PARAMETER_LENGTH;
 const HAS_MESSAGE = NEXT_LEAF + 4;
 const MESSAGE = HAS_MESSAGE + 1;
-const RECORD = MESSAGE + MESSAGE_LENGTH;
+const SALT = MESSAGE + MESSAGE_LENGTH;
+const SECRETS = SALT + SALT_LENGTH;
 
-/**
- * Owns leaf allocation, after winterwallet's client. Here because Theorem 1 admits one signature per leaf
- * and neither the seed nor the chain records which leaves are spent: `create` from a fresh seed, `open`
- * from the file only, `sign` records before it signs and repeats the last message for free, `close`
- * releases the file. Needs Bun on a unix host for the kernel lock; see `acquire`.
- */
+/** Owns leaf allocation and exact retries. Needs Bun on a unix host for the permanent kernel lock. */
 export class Signer<S> {
   readonly #key: OneTime<S>;
-  readonly #seed: Uint8Array;
-  readonly #parameter: Uint8Array;
   readonly #path: string;
   readonly #lock: number;
   #nextLeaf: number;
   #lastMessage: Uint8Array | undefined;
+  #lastSalt: Uint8Array;
   #closed = false;
 
-  private constructor(key: OneTime<S>, seed: Uint8Array, parameter: Uint8Array, path: string, lock: number, nextLeaf: number, lastMessage?: Uint8Array) {
+  private constructor(key: OneTime<S>, path: string, lock: number, nextLeaf: number, lastSalt: Uint8Array, lastMessage?: Uint8Array) {
     this.#key = key;
-    this.#seed = seed;
-    this.#parameter = parameter;
     this.#path = path;
     this.#lock = lock;
     this.#nextLeaf = nextLeaf;
     this.#lastMessage = lastMessage;
+    this.#lastSalt = lastSalt;
   }
 
-  /** `seed` and `parameter` are the caller's fresh randomness, Construction 3's `sk` and `P`; the seed must never have signed. The file is what to back up. */
-  static create<S>(type: KeyType<S>, path: string, seed: Uint8Array | ArrayLike<number>, parameter: Uint8Array | ArrayLike<number>): Signer<S> {
-    const bytesOfSeed = bytes(seed, 32, 'seed');
-    const bytesOfParameter = bytes(parameter, PARAMETER_LENGTH, 'parameter');
+  /** Sample every chain start and `P` from the OS random source. Refuses an existing file; back up the whole file. */
+  static create<S>(type: KeyType<S>, path: string): Signer<S> {
     const lock = acquire(path);
     try {
       let fd: number;
-      try {
-        fd = openSync(path, 'wx', 0o600);
-      } catch (error) {
+      try { fd = openSync(path, 'wx', 0o600); }
+      catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error('a key file already exists at this path: open it instead');
         throw error;
       }
-      const signer = new Signer(type.new(bytesOfSeed, bytesOfParameter), bytesOfSeed, bytesOfParameter, path, lock, 0);
-      writeSync(fd, signer.#record());
-      fsyncSync(fd);
-      closeSync(fd);
+      let signer: Signer<S>;
+      const secrets = new Uint8Array(type.LEAVES * ELEMENTS_LENGTH);
+      try {
+        randomFillSync(secrets);
+        const parameter = randomFillSync(new Uint8Array(PARAMETER_LENGTH));
+        signer = new Signer(type.new(secrets, parameter), path, lock, 0, new Uint8Array(SALT_LENGTH));
+        signer.#writeRecord(fd);
+        fsyncSync(fd);
+      } finally { secrets.fill(0); closeSync(fd); }
       syncDir(path);
       return signer;
-    } catch (error) {
-      release(lock);
-      throw error;
-    }
+    } catch (error) { release(lock); throw error; }
   }
 
+  /** Continue from a v2 file. Seed-based v1 records are rejected. */
   static open<S>(type: KeyType<S>, path: string): Signer<S> {
     const lock = acquire(path);
     try {
       let record: Buffer;
-      try {
-        record = readFileSync(path);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('no key file at this path: a seed alone cannot say which leaves are spent');
+      try { record = readFileSync(path); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('no key file at this path: usage state is required');
         throw error;
       }
-      const corrupt = new Error('the key file is not a record of this instance');
-      if (record.length !== RECORD || record[0] !== VERSION || record[HAS_MESSAGE]! > 1) throw corrupt;
-      const seed = Uint8Array.from(record.subarray(SEED, PARAMETER));
-      const parameter = Uint8Array.from(record.subarray(PARAMETER, NEXT_LEAF));
-      const key = type.new(seed, parameter);
-      const nextLeaf = record.readUInt32BE(NEXT_LEAF);
-      if (record[1] !== key.height || nextLeaf > key.leaves || (record[HAS_MESSAGE] === 1 && nextLeaf === 0)) throw corrupt;
-      const lastMessage = record[HAS_MESSAGE] === 1 ? Uint8Array.from(record.subarray(MESSAGE, RECORD)) : undefined;
-      return new Signer(key, seed, parameter, path, lock, nextLeaf, lastMessage);
-    } catch (error) {
-      release(lock);
-      throw error;
-    }
+      try {
+        const corrupt = new Error('the key file is not a record of this instance');
+        if (record.length !== SECRETS + type.LEAVES * ELEMENTS_LENGTH || record[0] !== VERSION
+            || record[1] !== type.HEIGHT || record[HAS_MESSAGE]! > 1) throw corrupt;
+        const parameter = record.subarray(PARAMETER, NEXT_LEAF);
+        const nextLeaf = record.readUInt32BE(NEXT_LEAF);
+        const lastMessage = record[HAS_MESSAGE] === 1 ? Uint8Array.from(record.subarray(MESSAGE, SALT)) : undefined;
+        const lastSalt = Uint8Array.from(record.subarray(SALT, SECRETS));
+        if (nextLeaf > type.LEAVES || Boolean(lastMessage) !== (nextLeaf > 0)
+            || (lastMessage ? !encode(lastSalt, parameter, nextLeaf - 1, lastMessage) : record.subarray(MESSAGE, SECRETS).some((b) => b !== 0))) throw corrupt;
+        return new Signer(type.new(record.subarray(SECRETS), parameter), path, lock, nextLeaf, lastSalt, lastMessage);
+      } finally { record.fill(0); }
+    } catch (error) { release(lock); throw error; }
   }
 
   /** `floor` is the chain's last accepted leaf plus one: catches a restored old copy, not unlanded exposure. */
   floor(floor: number): this {
+    if (!Number.isInteger(floor) || floor < 0 || floor > this.#key.leaves) { this.close(); throw new RangeError('invalid leaf floor'); }
     if (this.#nextLeaf < floor) {
       this.close();
       throw new Error(`the key file is behind the chain: next leaf ${this.#nextLeaf}, floor ${floor}`);
@@ -417,35 +408,30 @@ export class Signer<S> {
     return this;
   }
 
-  get publicKey(): PublicKey {
-    return this.#key.publicKey;
-  }
+  get publicKey(): PublicKey { return this.#key.publicKey; }
+  get nextLeaf(): number { return this.#nextLeaf; }
+  get remaining(): number { return this.#key.leaves - this.#nextLeaf; }
 
-  get nextLeaf(): number {
-    return this.#nextLeaf;
-  }
-
-  get remaining(): number {
-    return this.#key.leaves - this.#nextLeaf;
-  }
-
-  /** Record first, sign second (RFC 8391 §4.1.9); the last message is repeated, never re-spent. */
+  /** Sample salts, persist the accepted salt and allocation, then sign. Retry with the persisted salt. */
   sign(message: Uint8Array): S {
     if (this.#closed) throw new Error('the signer is closed');
     const bytesOfMessage = bytes(message, MESSAGE_LENGTH, 'message');
-    if (this.#lastMessage && equal(bytesOfMessage, this.#lastMessage)) return this.#key.signAt(this.#nextLeaf - 1, bytesOfMessage);
+    if (this.#lastMessage && equal(bytesOfMessage, this.#lastMessage)) return this.#key.signAt(this.#nextLeaf - 1, bytesOfMessage, this.#lastSalt);
     if (this.#nextLeaf >= this.#key.leaves) throw new Error('leaves exhausted');
     const leaf = this.#nextLeaf;
-    this.#nextLeaf = leaf + 1;
-    this.#lastMessage = bytesOfMessage;
-    try {
-      this.#write();
-    } catch (error) {
-      // On disk or not, the leaf stays spent; the message goes so the unrecorded signature is never handed out.
-      this.#lastMessage = undefined;
-      throw error;
+    const parameter = this.publicKey.parameter;
+    const salt = new Uint8Array(SALT_LENGTH);
+    for (let trial = 0; trial < MAX_TRIALS; trial++) {
+      randomFillSync(salt);
+      if (!encode(salt, parameter, leaf, bytesOfMessage)) continue;
+      this.#nextLeaf = leaf + 1;
+      this.#lastMessage = bytesOfMessage;
+      this.#lastSalt = salt;
+      try { this.#write(); }
+      catch (error) { this.close(); throw error; }
+      return this.#key.signAt(leaf, bytesOfMessage, salt);
     }
-    return this.#key.signAt(leaf, bytesOfMessage);
+    throw new Error('4096 salts missed the target sum; no leaf was spent');
   }
 
   close(): void {
@@ -454,26 +440,27 @@ export class Signer<S> {
     release(this.#lock);
   }
 
-  #record(): Buffer {
-    const record = Buffer.alloc(RECORD);
-    record[0] = VERSION;
-    record[1] = this.#key.height;
-    record.set(this.#seed, SEED);
-    record.set(this.#parameter, PARAMETER);
-    record.writeUInt32BE(this.#nextLeaf, NEXT_LEAF);
+  #writeRecord(fd: number): void {
+    const header = Buffer.alloc(SECRETS);
+    header[0] = VERSION;
+    header[1] = this.#key.height;
+    header.set(this.publicKey.parameter, PARAMETER);
+    header.writeUInt32BE(this.#nextLeaf, NEXT_LEAF);
     if (this.#lastMessage) {
-      record[HAS_MESSAGE] = 1;
-      record.set(this.#lastMessage, MESSAGE);
+      header[HAS_MESSAGE] = 1;
+      header.set(this.#lastMessage, MESSAGE);
+      header.set(this.#lastSalt, SALT);
     }
-    return record;
+    const secrets = this.#key.secrets;
+    try { writeFileSync(fd, header); writeFileSync(fd, secrets); }
+    finally { secrets.fill(0); }
   }
 
   #write(): void {
     const tmp = `${this.#path}.tmp`;
     const fd = openSync(tmp, 'w', 0o600);
-    writeSync(fd, this.#record());
-    fsyncSync(fd);
-    closeSync(fd);
+    try { this.#writeRecord(fd); fsyncSync(fd); }
+    finally { closeSync(fd); }
     renameSync(tmp, this.#path);
     syncDir(this.#path);
   }
@@ -488,11 +475,10 @@ export class Signer<S> {
  */
 function acquire(path: string): number {
   const fd = openSync(`${path}.lock`, 'a', 0o600);
-  if (!flock(fd)) {
-    closeSync(fd);
-    throw new Error(`the key file is held by another signer (${path}.lock)`);
-  }
-  return fd;
+  try {
+    if (!flock(fd)) throw new Error(`the key file is held by another signer (${path}.lock)`);
+    return fd;
+  } catch (error) { closeSync(fd); throw error; }
 }
 
 function release(fd: number): void {
@@ -520,6 +506,5 @@ function flock(fd: number): boolean {
 function syncDir(path: string): void {
   if (process.platform === 'win32') return;
   const fd = openSync(dirname(path) || '.', 'r');
-  fsyncSync(fd);
-  closeSync(fd);
+  try { fsyncSync(fd); } finally { closeSync(fd); }
 }

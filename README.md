@@ -8,13 +8,13 @@ Post-quantum hash-based signatures for Solana programs, verified with the
 Winternitz, Constructions 3 and 6 of
 [Drake, Khovratovich, Kudinov and Wagner, IACR CiC 2025](https://eprint.iacr.org/2025/055),
 in the paper's SHA-3 instantiation (§7.2) at its §8 operating point, with
-the parameters, key derivation and 32-byte messages of the authors'
-implementation [hash-sig](https://github.com/b-wagn/hash-sig). Keccak-256
-stands in for SHA3-256, the one substitution the platform forces; with
-that substitution, hash-sig's keys and signatures are reproduced here
-byte for byte. The security level is the paper's 128 bits classical and
-64 bits quantum (Corollary 2, Parameter Requirements 2 and 3). Research
-code, not audited.
+the parameters and 32-byte messages of the authors' implementation
+[hash-sig](https://github.com/b-wagn/hash-sig), and with chain starts,
+parameter and salts sampled as the paper writes them. Keccak-256 stands
+in for SHA3-256, the one substitution the platform forces; with that
+substitution, hash-sig's signatures verify here. The security level is
+the paper's 128 bits classical and 64 bits quantum (Corollary 2,
+Parameter Requirements 2 and 3). Research code, not audited.
 
 | Instance | Signatures per key | Signature | Public key | Verify CU |
 |---|---:|---:|---:|---:|
@@ -67,10 +67,9 @@ bun add @blueshift-gg/solana-winternitz
 
 ```ts
 import { keccak_256 } from '@noble/hashes/sha3.js';
-import { randomBytes } from 'node:crypto';
 import { Signer, winternitz, xmss } from '@blueshift-gg/solana-winternitz';
 
-const signer = Signer.create(xmss.SecretKey, 'tree.key', randomBytes(32), randomBytes(18)); // ~1 s: builds 256 leaves
+const signer = Signer.create(xmss.SecretKey, 'tree.key'); // samples the key, ~1 s: builds 256 leaves
 const treeKey = signer.publicKey; // 41 bytes, register on-chain
 const message = keccak_256(payload); // the digest the program will compute
 const signature = signer.sign(message); // spends leaf 0, recorded in the file first
@@ -78,21 +77,23 @@ signer.sign(message); // the same message again: same bytes, no leaf spent
 signer.close();
 
 const again = Signer.open(xmss.SecretKey, 'tree.key').floor(lastAcceptedOnChain + 1);
-const once = Signer.create(winternitz.SecretKey, 'once.key', randomBytes(32), randomBytes(18)); // one leaf
+const once = Signer.create(winternitz.SecretKey, 'once.key'); // one leaf
 ```
 
 The same `Signer` exists in Rust behind the `sign` feature, with
 `create`, `open`, `floor`, `sign`, `public_key`, `next_leaf` and
 `remaining`. The two read each other's key files and honour each other's
-locks. The key file is the key: seed, public parameter, next leaf and
-last message in 89 bytes, so back up the file, not the seed. `create`
-takes a fresh 32-byte seed and a fresh 18-byte parameter, the paper's
-`sk` and `P`, and refuses an existing file. `open` takes only a file.
-One process holds a file at a time, through a kernel lock on a
-permanent `.lock` sidecar that the OS releases if the holder dies. The
-TypeScript signer needs Bun on a unix host for that call; verification
-and key generation run anywhere. `signAt` and `sign_at` sign under an
-explicit leaf and record nothing; they exist for tests and vectors.
+locks. `create` samples every chain start and the parameter from the
+operating system's random source, as the paper's key generation does,
+and refuses an existing file; `open` takes only a file. The key file is
+the key and its only copy: the chain starts, the parameter, the next
+leaf, and the last message with its salt, 906 bytes for `winternitz` and
+212,046 for `xmss`. Back up the file. One process holds a file at a
+time, through a kernel lock on a permanent `.lock` sidecar that the OS
+releases if the holder dies. The TypeScript signer needs Bun on a unix
+host for that call; verification and key generation run anywhere.
+`signAt` and `sign_at` sign under an explicit leaf with a given salt and
+record nothing; they exist for tests and vectors.
 
 ## Rules
 
@@ -106,8 +107,6 @@ explicit leaf and record nothing; they exist for tests and vectors.
   that reached any RPC has spent its leaf, landed or not.
 - A leaf index is a counter, the paper's epoch. Never derive it from a
   slot or the Solana epoch.
-- One seed per key. The two instances built from one seed and parameter
-  share leaf 0, as hash-sig keys of different lifetimes do.
 
 ## Parameters
 
@@ -133,18 +132,19 @@ longer lifetime.
 ## Tests
 
 `cargo test --lib` pins the four parameter bounds, Keccak-256 against its
-known answers, the syscall id, hash-sig's key, public key and signatures
-reproduced from
-[`tests/hash-sig.json`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/hash-sig.json),
-both instances against
-[`tests/vectors.json`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/vectors.json)
+known answers, the syscall id, hash-sig's signatures in
+[`tests/hash-sig.json`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/hash-sig.json)
+verifying, signing from explicit chain starts and salts against
+[`tests/sampled.json`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/sampled.json)
 and the key file
 [`tests/winternitz.key`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/winternitz.key),
-rejection of every single-byte tamper, and the signer's rules and lock
-protocol. The TypeScript package is a second implementation written from
-`SPEC.md`, sharing no code, that must reproduce every vector and the
-hash-sig key. `tests/sbpf.rs` measures the verifiers as SBPF programs
-under Mollusk and needs `cargo build-sbf`.
+rejection of every single-byte tamper, the signer's rules, and its lock
+dying with its holder. The TypeScript package is a second implementation
+written from `SPEC.md`, sharing no code, that must reproduce the same
+fixtures and additionally checks that a failed random source, salt
+exhaustion and a failed write release no signature. `tests/sbpf.rs`
+measures the verifiers as SBPF programs under Mollusk and needs
+`cargo build-sbf`.
 
 ```sh
 cargo test --lib

@@ -4,9 +4,10 @@
 //!
 //! The construction is [DKKW25] Construction 3 over Construction 6 with the
 //! §7.2 instantiation and the parameters of the authors' implementation,
-//! hash-sig, Keccak-256 standing in for SHA3-256 (`hash.rs`). Key material
-//! and salts come from a seed through hash-sig's PRF (Remark 7, `seed`).
-//! On `target_os = "solana"` every hash is the `sol_keccak256` syscall.
+//! hash-sig, Keccak-256 standing in for SHA3-256 (`hash.rs`). Chain
+//! starts, the parameter and salts are sampled as Construction 3 writes
+//! them (`signing`, `signer`). On `target_os = "solana"` every hash is the
+//! `sol_keccak256` syscall.
 #![no_std]
 #![deny(missing_docs, clippy::undocumented_unsafe_blocks)]
 
@@ -202,87 +203,53 @@ fn node(
         .unwrap()
 }
 
-/// Chain starts and salt candidates from one 32-byte seed: hash-sig's
-/// `ShaPRF` byte for byte, Remark 7's PRF, `H(sep ‖ purpose ‖ key ‖ epoch ‖
-/// index)` for starts and `H(sep ‖ purpose ‖ key ‖ epoch ‖ m ‖ counter)` for
-/// salts, which the paper samples fresh: distinct (purpose, leaf, counter)
-/// labels make them independent under the PRF, and one message per leaf
-/// keeps the labels distinct. The PRF is keyed by the seed alone, so the
-/// two instances of one seed and `P` share leaf 0, as hash-sig's lifetimes
-/// do: one seed per key. `P` is not derived: Construction 3 samples it, and
-/// so does [`Signer::create`]'s caller.
+/// Host-side Construction 3 over explicitly sampled chain starts.
 #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
-mod seed {
+mod signing {
     use super::*;
 
-    /// `K` of Construction 3, error `δ^K` by Lemma 3: ~111 expected, all
-    /// miss once in e^36.8. Eq. (14) prices the salt for this `K`; hash-sig
-    /// allows 100 000 and produces the same salts up to here.
+    /// `K` of Construction 3; salt candidates are sampled independently.
     pub const MAX_TRIALS: u32 = 4096;
 
-    /// hash-sig `symmetric/prf/sha.rs`: `PRF_DOMAIN_SEP`, then the purpose
-    /// byte for a domain element or randomness.
-    const DOMAIN_SEP: [u8; 16] = [
-        0x00, 0x01, 0x12, 0xff, 0x00, 0x01, 0xfa, 0xff, 0x00, 0xaf, 0x12, 0xff, 0x01, 0xfa, 0xff,
-        0x00,
-    ];
-    const DOMAIN_ELEMENT: u8 = 0;
-    const RANDOMNESS: u8 = 1;
-
-    fn start(seed: &[u8; 32], leaf: u32, i: u8) -> [u8; ELEMENT_LENGTH] {
-        hash::hashv(&[
-            &DOMAIN_SEP,
-            &[DOMAIN_ELEMENT],
-            seed,
-            &leaf.to_be_bytes(),
-            &u64::from(i).to_be_bytes(),
-        ])[..ELEMENT_LENGTH]
-            .try_into()
-            .unwrap()
-    }
-
-    /// Construction 3 Gen step 2: the chain ends `pk_ep`.
-    pub fn ends(seed: &[u8; 32], parameter: &[u8], leaf: u32) -> [[u8; ELEMENT_LENGTH]; CHAINS] {
+    pub fn ends(secrets: &[u8], parameter: &[u8], leaf: u32) -> [[u8; ELEMENT_LENGTH]; CHAINS] {
         let mut chain = Chain::new(parameter, leaf);
-        let mut ends = [[0u8; ELEMENT_LENGTH]; CHAINS];
-        for (i, end) in ends.iter_mut().enumerate() {
-            *end = chain.walk(i as u8, 0, POSITIONS - 1, &start(seed, leaf, i as u8));
-        }
-        ends
+        core::array::from_fn(|i| {
+            let offset = leaf as usize * ELEMENTS_LENGTH + i * ELEMENT_LENGTH;
+            chain.walk(
+                i as u8,
+                0,
+                POSITIONS - 1,
+                secrets[offset..offset + ELEMENT_LENGTH].try_into().unwrap(),
+            )
+        })
     }
 
-    /// Construction 3 Sig steps 3–5 with salt candidates from the PRF over
-    /// `(leaf, m, ctr)`; `None` iff all `MAX_TRIALS` miss.
+    /// Sign with an already accepted salt, allowing a persisted signature to
+    /// be reproduced without drawing fresh randomness under a spent leaf.
     pub fn sign(
-        seed: &[u8; 32],
+        secrets: &[u8],
         parameter: &[u8],
         leaf: u32,
         message: &[u8; MESSAGE_LENGTH],
-    ) -> Option<([u8; SALT_LENGTH], [u8; ELEMENTS_LENGTH])> {
+        salt: &[u8; SALT_LENGTH],
+    ) -> Option<[u8; ELEMENTS_LENGTH]> {
+        let x = encode(salt, parameter, leaf, message)?;
         let mut chain = Chain::new(parameter, leaf);
-        (0..MAX_TRIALS).find_map(|ctr| {
-            let salt: [u8; SALT_LENGTH] = hash::hashv(&[
-                &DOMAIN_SEP,
-                &[RANDOMNESS],
-                seed,
-                &leaf.to_be_bytes(),
-                message,
-                &u64::from(ctr).to_be_bytes(),
-            ])[..SALT_LENGTH]
-                .try_into()
-                .unwrap();
-            let x = encode(&salt, parameter, leaf, message)?;
-            let mut elements = [0u8; ELEMENTS_LENGTH];
-            for (i, (slot, &xi)) in elements
-                .as_chunks_mut::<ELEMENT_LENGTH>()
-                .0
-                .iter_mut()
-                .zip(&x)
-                .enumerate()
-            {
-                *slot = chain.walk(i as u8, 0, xi, &start(seed, leaf, i as u8));
-            }
-            Some((salt, elements))
-        })
+        let mut elements = [0; ELEMENTS_LENGTH];
+        for (i, slot) in elements
+            .as_chunks_mut::<ELEMENT_LENGTH>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            let offset = leaf as usize * ELEMENTS_LENGTH + i * ELEMENT_LENGTH;
+            *slot = chain.walk(
+                i as u8,
+                0,
+                x[i],
+                secrets[offset..offset + ELEMENT_LENGTH].try_into().unwrap(),
+            );
+        }
+        Some(elements)
     }
 }

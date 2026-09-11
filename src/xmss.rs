@@ -65,11 +65,11 @@ impl Signature {
     }
 }
 
-/// Construction 3 Gen with Remark 7's PRF, every node kept (Remark 3):
-/// ~135k hashes to build. Not `Clone`, not `Debug`.
+/// Construction 3 Gen over sampled chain starts, every node kept (Remark
+/// 3): ~148k hashes to build. Not `Clone`, not `Debug`.
 #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
 pub struct SecretKey {
-    seed: [u8; 32],
+    secrets: std::vec::Vec<u8>,
     parameter: [u8; crate::PARAMETER_LENGTH],
     /// Level-major: leaves first, root last.
     nodes: [[u8; ELEMENT_LENGTH]; 2 * LEAVES as usize - 1],
@@ -78,7 +78,7 @@ pub struct SecretKey {
 #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
 impl Drop for SecretKey {
     fn drop(&mut self) {
-        crate::wipe(&mut self.seed);
+        crate::wipe(&mut self.secrets);
     }
 }
 
@@ -102,13 +102,16 @@ impl crate::OneTime for SecretKey {
     const HEIGHT: u8 = HEIGHT as u8;
 
     /// Construction 3 Gen: every chain of every leaf, then the tree.
-    fn new(seed: [u8; 32], parameter: [u8; crate::PARAMETER_LENGTH]) -> Self {
+    fn new(secrets: &[u8], parameter: [u8; crate::PARAMETER_LENGTH]) -> Option<Self> {
+        if secrets.len() != Self::LEAVES as usize * ELEMENTS_LENGTH {
+            return None;
+        }
         let mut nodes = [[0u8; ELEMENT_LENGTH]; 2 * LEAVES as usize - 1];
         for leaf in 0..LEAVES {
             nodes[leaf as usize] = leaf_hash(
                 &parameter,
                 leaf,
-                &crate::seed::ends(&seed, &parameter, leaf),
+                &crate::signing::ends(secrets, &parameter, leaf),
             );
         }
         for l in 1..=HEIGHT {
@@ -123,11 +126,15 @@ impl crate::OneTime for SecretKey {
                 );
             }
         }
-        Self {
-            seed,
+        Some(Self {
+            secrets: secrets.to_vec(),
             parameter,
             nodes,
-        }
+        })
+    }
+
+    fn secrets(&self) -> &[u8] {
+        &self.secrets
     }
 
     fn public_key(&self) -> PublicKey {
@@ -135,15 +142,20 @@ impl crate::OneTime for SecretKey {
     }
 
     /// Construction 3 Sig plus Construction 1 Path. Records nothing;
-    /// `None` if `leaf >= LEAVES` or every salt misses.
-    fn sign_at(&self, leaf: u32, message: &[u8; MESSAGE_LENGTH]) -> Option<Signature> {
+    /// `None` if `leaf >= LEAVES` or the salt misses the target sum.
+    fn sign_at(
+        &self,
+        leaf: u32,
+        message: &[u8; MESSAGE_LENGTH],
+        salt: &[u8; SALT_LENGTH],
+    ) -> Option<Signature> {
         if leaf >= LEAVES {
             return None;
         }
-        let (salt, elements) = crate::seed::sign(&self.seed, &self.parameter, leaf, message)?;
+        let elements = crate::signing::sign(&self.secrets, &self.parameter, leaf, message, salt)?;
         let mut sig = Signature([0; SIGNATURE_LENGTH]);
         sig.0[..SALT].copy_from_slice(&leaf.to_be_bytes());
-        sig.0[SALT..ELEMENTS].copy_from_slice(&salt);
+        sig.0[SALT..ELEMENTS].copy_from_slice(salt);
         sig.0[ELEMENTS..PATH].copy_from_slice(&elements);
         for (l, slot) in sig.0[PATH..]
             .as_chunks_mut::<ELEMENT_LENGTH>()

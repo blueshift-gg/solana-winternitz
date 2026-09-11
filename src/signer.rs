@@ -1,18 +1,15 @@
-//! Host-side signer owning leaf allocation, after winterwallet's client.
-//! Here because Theorem 1 admits one signature per leaf and neither the
-//! seed nor the chain records which leaves are spent: the record is
-//! written before a signature exists, one instance holds a file, and a
-//! file opens only from itself. The file holds the seed and `P`, which
-//! Construction 3 samples independently and the caller supplies.
+//! Host-side leaf allocation. Sample a salt, durably record it with the
+//! message and next leaf, then compute the signature. A permanent kernel
+//! lock serializes writers; retries use the recorded salt.
 
 use std::fs::{self, File, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{MESSAGE_LENGTH, PARAMETER_LENGTH, PublicKey};
+use crate::{ELEMENTS_LENGTH, MESSAGE_LENGTH, PARAMETER_LENGTH, PublicKey, SALT_LENGTH, encode};
 
-/// The two instances as the signer sees them. `sign_at` is Construction 3's
-/// Sig with no one-use rule; [`Signer`] supplies the rule.
+/// Raw Construction 3 operations. These do not enforce one use per leaf;
+/// use [`Signer`] for signing. Never reuse chain starts across keys.
 pub trait OneTime: Sized {
     /// The instance's signature type.
     type Signature;
@@ -20,13 +17,22 @@ pub trait OneTime: Sized {
     const LEAVES: u32;
     /// In the key file, so a file opens only under its own instance.
     const HEIGHT: u8;
-    /// Construction 3 Gen from a 32-byte seed and the sampled parameter `P`.
-    fn new(seed: [u8; 32], parameter: [u8; PARAMETER_LENGTH]) -> Self;
+    /// Copy independently sampled chain starts in leaf-major, chain-major
+    /// order (828 bytes per leaf), and the independently sampled `P`.
+    /// Returns `None` for the wrong secret length. Records no usage state.
+    fn new(secrets: &[u8], parameter: [u8; PARAMETER_LENGTH]) -> Option<Self>;
+    /// Raw secret bytes for persistence. These alone cannot restore usage state.
+    fn secrets(&self) -> &[u8];
     /// `root ‖ P`.
     fn public_key(&self) -> PublicKey;
-    /// Construction 3 Sig under `leaf`, recording nothing. `None` when the
-    /// leaf is out of range or every salt misses.
-    fn sign_at(&self, leaf: u32, message: &[u8; MESSAGE_LENGTH]) -> Option<Self::Signature>;
+    /// Sign with an accepted salt. `None` for an invalid leaf or encoding.
+    /// Never use a spent leaf with a different message or salt.
+    fn sign_at(
+        &self,
+        leaf: u32,
+        message: &[u8; MESSAGE_LENGTH],
+        salt: &[u8; SALT_LENGTH],
+    ) -> Option<Self::Signature>;
 }
 
 /// Every variant fails closed: no signature is released.
@@ -34,12 +40,11 @@ pub trait OneTime: Sized {
 pub enum SignerError {
     /// `create` on an existing key file.
     Exists,
-    /// `open` with no key file: a seed cannot say which leaves are spent.
+    /// `open` with no key file.
     Missing,
     /// Another signer holds the file.
     Locked,
-    /// Wrong length, version or instance height, or a record that
-    /// contradicts itself.
+    /// Wrong length, version, instance or retry state.
     Corrupt,
     /// The record is behind the chain: a restored old copy.
     BelowFloor {
@@ -50,8 +55,12 @@ pub enum SignerError {
     },
     /// Every leaf is spent.
     Exhausted,
-    /// All `K` salts missed; the leaf is spent anyway.
+    /// All `K` salts missed; no leaf was spent.
     SaltsExhausted,
+    /// The operating system could not provide randomness.
+    Random(getrandom::Error),
+    /// A previous write failed. Drop the signer and reopen the file.
+    Unusable,
     /// The file system refused; the leaf may or may not be recorded.
     Io(io::Error),
 }
@@ -66,9 +75,7 @@ impl core::fmt::Display for SignerError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Exists => f.write_str("a key file already exists at this path: open it instead"),
-            Self::Missing => f.write_str(
-                "no key file at this path: a seed alone cannot say which leaves are spent",
-            ),
+            Self::Missing => f.write_str("no key file at this path: usage state is required"),
             Self::Locked => f.write_str("the key file is held by another signer"),
             Self::Corrupt => f.write_str("the key file is not a record of this instance"),
             Self::BelowFloor { next_leaf, floor } => write!(
@@ -77,53 +84,44 @@ impl core::fmt::Display for SignerError {
             ),
             Self::Exhausted => f.write_str("every leaf is spent"),
             Self::SaltsExhausted => {
-                f.write_str("4096 salts missed the target sum; the leaf is spent")
+                f.write_str("4096 salts missed the target sum; no leaf was spent")
+            }
+            Self::Random(error) => write!(f, "randomness unavailable: {error}"),
+            Self::Unusable => {
+                f.write_str("a write failed: drop the signer and reopen the key file")
             }
             Self::Io(error) => write!(f, "{error}"),
         }
     }
 }
-
 impl std::error::Error for SignerError {}
 
-// Key file: version ‖ height ‖ seed ‖ P ‖ next leaf BE ‖ message flag ‖
-// last message, 89 bytes, byte-identical to the TypeScript package's.
-const VERSION: u8 = 1;
-const SEED: usize = 2;
-const PARAMETER: usize = SEED + 32;
+// v2: version || height || P || next leaf BE || message flag || message ||
+// accepted salt || chain starts. The fixed header is 78 bytes.
+const VERSION: u8 = 2;
+const PARAMETER: usize = 2;
 const NEXT_LEAF: usize = PARAMETER + PARAMETER_LENGTH;
 const HAS_MESSAGE: usize = NEXT_LEAF + 4;
 const MESSAGE: usize = HAS_MESSAGE + 1;
-const RECORD: usize = MESSAGE + MESSAGE_LENGTH;
+const SALT: usize = MESSAGE + MESSAGE_LENGTH;
+const SECRETS: usize = SALT + SALT_LENGTH;
 
-/// `create` from a fresh seed, `open` from the file, `sign` a message: a
-/// new message spends the next leaf after the record is on disk, the last
-/// message again returns the same bytes and spends nothing.
+/// A newly sampled key or an existing key file, held exclusively. Every
+/// new message spends a leaf; the last message returns the same signature.
 pub struct Signer<K: OneTime> {
     key: K,
-    seed: [u8; 32],
-    parameter: [u8; PARAMETER_LENGTH],
     path: PathBuf,
     _lock: File,
     next_leaf: u32,
     last_message: Option<[u8; MESSAGE_LENGTH]>,
-}
-
-impl<K: OneTime> Drop for Signer<K> {
-    fn drop(&mut self) {
-        crate::wipe(&mut self.seed);
-    }
+    last_salt: [u8; SALT_LENGTH],
+    failed: bool,
 }
 
 impl<K: OneTime> Signer<K> {
-    /// `seed` and `parameter` are the caller's fresh randomness, Construction
-    /// 3's `sk` and `P`; the seed must never have signed. The file is what
-    /// to back up.
-    pub fn create(
-        path: impl AsRef<Path>,
-        seed: [u8; 32],
-        parameter: [u8; PARAMETER_LENGTH],
-    ) -> Result<Self, SignerError> {
+    /// Sample every chain start and `P` from the OS random source, as in
+    /// Construction 3 Gen. Refuses an existing file. Back up the whole file.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, SignerError> {
         let path = path.as_ref().to_path_buf();
         let lock = lock(&path)?;
         let mut file = options()
@@ -134,55 +132,73 @@ impl<K: OneTime> Signer<K> {
                 io::ErrorKind::AlreadyExists => SignerError::Exists,
                 _ => SignerError::Io(error),
             })?;
+        let mut secrets = std::vec![0; K::LEAVES as usize * ELEMENTS_LENGTH];
+        let mut parameter = [0; PARAMETER_LENGTH];
+        let sampled = getrandom::fill(&mut secrets).and_then(|()| getrandom::fill(&mut parameter));
+        let key = sampled
+            .map_err(SignerError::Random)
+            .and_then(|()| K::new(&secrets, parameter).ok_or(SignerError::Corrupt));
+        crate::wipe(&mut secrets);
         let signer = Self {
-            key: K::new(seed, parameter),
-            seed,
-            parameter,
+            key: key?,
             path,
             _lock: lock,
             next_leaf: 0,
             last_message: None,
+            last_salt: [0; SALT_LENGTH],
+            failed: false,
         };
-        file.write_all(&signer.record())?;
+        signer.write_record(&mut file)?;
         file.sync_all()?;
         sync_dir(&signer.path)?;
         Ok(signer)
     }
 
-    /// Continue from the key file at `path`, holding it.
+    /// Continue from a v2 key file, holding its permanent sidecar lock.
+    /// Seed-based v1 files are rejected; they cannot become sampled keys.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SignerError> {
         let path = path.as_ref().to_path_buf();
         let lock = lock(&path)?;
-        let mut bytes = std::vec::Vec::new();
-        File::open(&path)
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::NotFound => SignerError::Missing,
-                _ => SignerError::Io(error),
-            })?
-            .read_to_end(&mut bytes)?;
-        let record: &[u8; RECORD] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| SignerError::Corrupt)?;
-        let next_leaf = u32::from_be_bytes(record[NEXT_LEAF..HAS_MESSAGE].try_into().unwrap());
-        if record[0] != VERSION
-            || record[1] != K::HEIGHT
-            || record[HAS_MESSAGE] > 1
-            || (record[HAS_MESSAGE] == 1 && next_leaf == 0)
+        let mut file = File::open(&path).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => SignerError::Missing,
+            _ => SignerError::Io(error),
+        })?;
+        let mut header = [0; SECRETS];
+        if file.metadata()?.len() != (SECRETS + K::LEAVES as usize * ELEMENTS_LENGTH) as u64 {
+            return Err(SignerError::Corrupt);
+        }
+        file.read_exact(&mut header)?;
+        let next_leaf = u32::from_be_bytes(header[NEXT_LEAF..HAS_MESSAGE].try_into().unwrap());
+        let parameter: [u8; PARAMETER_LENGTH] = header[PARAMETER..NEXT_LEAF].try_into().unwrap();
+        let last_message =
+            (header[HAS_MESSAGE] == 1).then(|| header[MESSAGE..SALT].try_into().unwrap());
+        let last_salt: [u8; SALT_LENGTH] = header[SALT..].try_into().unwrap();
+        if header[0] != VERSION
+            || header[1] != K::HEIGHT
+            || header[HAS_MESSAGE] > 1
             || next_leaf > K::LEAVES
+            || last_message.is_some() != (next_leaf > 0)
+            || match &last_message {
+                Some(message) => encode(&last_salt, &parameter, next_leaf - 1, message).is_none(),
+                None => header[MESSAGE..].iter().any(|&b| b != 0),
+            }
         {
             return Err(SignerError::Corrupt);
         }
-        let seed: [u8; 32] = record[SEED..PARAMETER].try_into().unwrap();
-        let parameter: [u8; PARAMETER_LENGTH] = record[PARAMETER..NEXT_LEAF].try_into().unwrap();
+        let mut secrets = std::vec![0; K::LEAVES as usize * ELEMENTS_LENGTH];
+        let key = file
+            .read_exact(&mut secrets)
+            .map_err(SignerError::Io)
+            .and_then(|()| K::new(&secrets, parameter).ok_or(SignerError::Corrupt));
+        crate::wipe(&mut secrets);
         Ok(Self {
-            key: K::new(seed, parameter),
-            seed,
-            parameter,
+            key: key?,
             path,
             _lock: lock,
             next_leaf,
-            last_message: (record[HAS_MESSAGE] == 1).then(|| record[MESSAGE..].try_into().unwrap()),
+            last_message,
+            last_salt,
+            failed: false,
         })
     }
 
@@ -197,59 +213,83 @@ impl<K: OneTime> Signer<K> {
         }
         Ok(self)
     }
-
     /// `root ‖ P`.
     pub fn public_key(&self) -> PublicKey {
         self.key.public_key()
     }
-
     /// The leaf the next new message spends.
     pub fn next_leaf(&self) -> u32 {
         self.next_leaf
     }
-
     /// Leaves not yet spent.
     pub fn remaining(&self) -> u32 {
         K::LEAVES - self.next_leaf
     }
 
-    /// Record first, sign second (RFC 8391 §4.1.9); the last message is
-    /// repeated, never re-spent.
+    /// Sample salt candidates, persist the accepted salt and allocation,
+    /// then sign. Retrying the last message uses the persisted salt.
     pub fn sign(&mut self, message: &[u8; MESSAGE_LENGTH]) -> Result<K::Signature, SignerError> {
-        if self.last_message.as_ref() == Some(message)
-            && let Some(signature) = self.key.sign_at(self.next_leaf - 1, message)
-        {
-            return Ok(signature);
+        self.sign_with(message, |salt| {
+            getrandom::fill(salt).map_err(SignerError::Random)
+        })
+    }
+
+    // Private entropy seam also tests exhaustion and RNG failure without a
+    // public deterministic-signing alternative to the safe signer.
+    fn sign_with(
+        &mut self,
+        message: &[u8; MESSAGE_LENGTH],
+        mut fill: impl FnMut(&mut [u8]) -> Result<(), SignerError>,
+    ) -> Result<K::Signature, SignerError> {
+        if self.failed {
+            return Err(SignerError::Unusable);
+        }
+        if self.last_message.as_ref() == Some(message) {
+            return self
+                .key
+                .sign_at(self.next_leaf - 1, message, &self.last_salt)
+                .ok_or(SignerError::Corrupt);
         }
         if self.next_leaf >= K::LEAVES {
             return Err(SignerError::Exhausted);
         }
         let leaf = self.next_leaf;
-        self.next_leaf = leaf + 1;
-        self.last_message = Some(*message);
-        if let Err(error) = self.write() {
-            // On disk or not, the leaf stays spent; the message goes so the
-            // unrecorded signature can never be handed out.
-            self.last_message = None;
-            return Err(error);
+        let parameter = self.public_key();
+        let mut salt = [0; SALT_LENGTH];
+        for _ in 0..crate::signing::MAX_TRIALS {
+            fill(&mut salt)?;
+            if encode(&salt, parameter.parameter(), leaf, message).is_none() {
+                continue;
+            }
+            self.next_leaf = leaf + 1;
+            self.last_message = Some(*message);
+            self.last_salt = salt;
+            if let Err(error) = self.write() {
+                self.failed = true;
+                return Err(error);
+            }
+            return self
+                .key
+                .sign_at(leaf, message, &salt)
+                .ok_or(SignerError::Corrupt);
         }
-        self.key
-            .sign_at(leaf, message)
-            .ok_or(SignerError::SaltsExhausted)
+        Err(SignerError::SaltsExhausted)
     }
 
-    fn record(&self) -> [u8; RECORD] {
-        let mut record = [0u8; RECORD];
-        record[0] = VERSION;
-        record[1] = K::HEIGHT;
-        record[SEED..PARAMETER].copy_from_slice(&self.seed);
-        record[PARAMETER..NEXT_LEAF].copy_from_slice(&self.parameter);
-        record[NEXT_LEAF..HAS_MESSAGE].copy_from_slice(&self.next_leaf.to_be_bytes());
+    fn write_record(&self, file: &mut File) -> Result<(), SignerError> {
+        let mut header = [0; SECRETS];
+        header[0] = VERSION;
+        header[1] = K::HEIGHT;
+        header[PARAMETER..NEXT_LEAF].copy_from_slice(self.public_key().parameter());
+        header[NEXT_LEAF..HAS_MESSAGE].copy_from_slice(&self.next_leaf.to_be_bytes());
         if let Some(message) = &self.last_message {
-            record[HAS_MESSAGE] = 1;
-            record[MESSAGE..].copy_from_slice(message);
+            header[HAS_MESSAGE] = 1;
+            header[MESSAGE..SALT].copy_from_slice(message);
+            header[SALT..].copy_from_slice(&self.last_salt);
         }
-        record
+        file.write_all(&header)?;
+        file.write_all(self.key.secrets())?;
+        Ok(())
     }
 
     fn write(&self) -> Result<(), SignerError> {
@@ -259,7 +299,7 @@ impl<K: OneTime> Signer<K> {
             .create(true)
             .truncate(true)
             .open(&tmp)?;
-        file.write_all(&self.record())?;
+        self.write_record(&mut file)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp, &self.path)?;
@@ -312,4 +352,117 @@ fn sync_dir(path: &Path) -> Result<(), SignerError> {
         File::open(parent.unwrap_or(Path::new(".")))?.sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::winternitz;
+
+    #[test]
+    fn failed_grinding_and_persistence_never_release_a_signature() {
+        let dir =
+            std::env::temp_dir().join(std::format!("winternitz-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("once.key");
+        let mut signer = Signer::<winternitz::SecretKey>::create(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let message = [0; MESSAGE_LENGTH];
+        let mut bad = [0; SALT_LENGTH];
+        for counter in 0u32.. {
+            bad[..4].copy_from_slice(&counter.to_le_bytes());
+            if encode(&bad, signer.public_key().parameter(), 0, &message).is_none() {
+                break;
+            }
+        }
+        let mut trials = 0;
+        assert!(matches!(
+            signer.sign_with(&message, |salt| {
+                trials += 1;
+                salt.copy_from_slice(&bad);
+                Ok(())
+            }),
+            Err(SignerError::SaltsExhausted)
+        ));
+        assert_eq!(trials, crate::signing::MAX_TRIALS);
+        assert!(matches!(
+            signer.sign_with(&message, |_| Err(SignerError::Io(io::Error::other(
+                "entropy unavailable"
+            )))),
+            Err(SignerError::Io(_))
+        ));
+        assert_eq!(signer.next_leaf(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        std::fs::create_dir(sibling(&path, ".tmp")).unwrap();
+        assert!(matches!(signer.sign(&message), Err(SignerError::Io(_))));
+        assert!(matches!(signer.sign(&message), Err(SignerError::Unusable)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(signer);
+        std::fs::remove_dir(sibling(&path, ".tmp")).unwrap();
+        let mut signer = Signer::<winternitz::SecretKey>::open(&path).unwrap();
+        let sig = signer.sign(&message).unwrap();
+        assert_eq!(
+            signer
+                .sign_with(&message, |_| panic!("retry drew randomness"))
+                .unwrap(),
+            sig
+        );
+        drop(signer);
+        let mut signer = Signer::<winternitz::SecretKey>::open(&path).unwrap();
+        assert_eq!(
+            signer
+                .sign_with(&message, |_| panic!("reopened retry drew randomness"))
+                .unwrap(),
+            sig
+        );
+        assert_eq!(sig.verify(&signer.public_key(), &message), Ok(()));
+        drop(signer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inconsistent_retry_records_and_legacy_files_are_rejected() {
+        let dir =
+            std::env::temp_dir().join(std::format!("winternitz-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("once.key");
+        let record = include_bytes!("../tests/winternitz.key");
+        let mut variants = std::vec::Vec::new();
+        let mut no_leaf = record.to_vec();
+        no_leaf[NEXT_LEAF..HAS_MESSAGE].fill(0);
+        variants.push(no_leaf);
+        let mut no_message = record.to_vec();
+        no_message[HAS_MESSAGE] = 0;
+        variants.push(no_message);
+        let mut invalid_salt = record.to_vec();
+        for counter in 0u32.. {
+            invalid_salt[SALT..SALT + 4].copy_from_slice(&counter.to_le_bytes());
+            if encode(
+                &invalid_salt[SALT..SECRETS],
+                &invalid_salt[PARAMETER..NEXT_LEAF],
+                0,
+                record[MESSAGE..SALT].try_into().unwrap(),
+            )
+            .is_none()
+            {
+                break;
+            }
+        }
+        variants.push(invalid_salt);
+        let mut legacy = std::vec![0; 89];
+        legacy[0] = 1;
+        variants.push(legacy);
+        let mut extra = record.to_vec();
+        extra.push(0);
+        variants.push(extra);
+        for bytes in variants {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(matches!(
+                Signer::<winternitz::SecretKey>::open(&path),
+                Err(SignerError::Corrupt)
+            ));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

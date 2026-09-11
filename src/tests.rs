@@ -1,7 +1,6 @@
 //! What is pinned: eqs. (13)–(16) and the grinding cost behind the
 //! constants, the hash and syscall-id constants against their sources, the
-//! key, public key and signatures of the authors' implementation reproduced
-//! byte for byte, both instances against `tests/vectors.json` and the
+//! signatures of the authors' implementation verified, both instances against `tests/vectors.json` and the
 //! key-file fixture, every single-byte tamper rejected, garbage rejected
 //! without panics, the signer's allocation rules, and its kernel lock
 //! dying with its holder.
@@ -11,7 +10,8 @@ use std::vec::Vec;
 
 use crate::{
     CHAINS, ELEMENT_LENGTH, Error, MESSAGE_LENGTH, OneTime, PARAMETER_LENGTH, POSITIONS,
-    PUBLIC_KEY_LENGTH, PublicKey, SALT_LENGTH, TARGET_SUM, hash, seed, syscalls, winternitz, xmss,
+    PUBLIC_KEY_LENGTH, PublicKey, SALT_LENGTH, TARGET_SUM, hash, signing, syscalls, winternitz,
+    xmss,
 };
 
 fn hex(s: &str) -> Vec<u8> {
@@ -25,10 +25,32 @@ fn to_hex(b: &[u8]) -> std::string::String {
     b.iter().map(|x| std::format!("{x:02x}")).collect()
 }
 
-fn seed(i: u8) -> [u8; 32] {
-    let mut seed = [0u8; 32];
-    seed[0] = i;
-    seed
+// Deliberately non-random public test data, never a production derivation.
+fn key<K: OneTime>(tag: u8) -> K {
+    let secrets: Vec<u8> = (0..K::LEAVES as usize * crate::ELEMENTS_LENGTH)
+        .map(|i| (i % 251) as u8 ^ tag)
+        .collect();
+    K::new(&secrets, parameter(tag)).unwrap()
+}
+
+fn salt(parameter: &[u8], leaf: u32, message: &[u8; MESSAGE_LENGTH]) -> [u8; SALT_LENGTH] {
+    let mut salt = [0; SALT_LENGTH];
+    for counter in 0u32.. {
+        salt[..4].copy_from_slice(&counter.to_le_bytes());
+        if crate::encode(&salt, parameter, leaf, message).is_some() {
+            return salt;
+        }
+    }
+    unreachable!()
+}
+
+fn sign<K: OneTime>(key: &K, leaf: u32, message: &[u8; MESSAGE_LENGTH]) -> K::Signature {
+    key.sign_at(
+        leaf,
+        message,
+        &salt(key.public_key().parameter(), leaf, message),
+    )
+    .unwrap()
 }
 
 fn parameter(i: u8) -> [u8; PARAMETER_LENGTH] {
@@ -73,7 +95,7 @@ fn parameters_satisfy_dkkw25_requirements() {
         f64::from(POSITIONS).log2(),
         CHAINS as f64,
         xmss::HEIGHT as f64,
-        f64::from(seed::MAX_TRIALS).log2(),
+        f64::from(signing::MAX_TRIALS).log2(),
     );
     // (13) digest, (14) salt, (15) element, (16) parameter, with qs = L.
     assert!(v * w >= (kc + log5 + 1.0).max(2.0 * (kq + log5 + 1.0) + 3.0));
@@ -132,19 +154,13 @@ fn syscall_ids_match_published_values() {
     assert_eq!(syscalls::sys_hash("sol_sha512"), 0x9229cdcc);
 }
 
-/// hash-sig at these type parameters, hash swapped to Keccak-256
-/// (`tests/hash-sig.json`, `source`): its PRF key and parameter give its
-/// public key and its signatures byte for byte, and they verify.
+/// Independently generated hash-sig signatures remain valid. Key sampling
+/// changes neither the wire format nor verification.
 #[test]
-fn reference_key_is_reproduced() {
+fn reference_signatures_verify() {
     let vectors: Value = serde_json::from_str(include_str!("../tests/hash-sig.json")).unwrap();
     let field = |v: &Value, k: &str| hex(v[k].as_str().unwrap());
-    let sk = xmss::SecretKey::new(
-        field(&vectors, "prf_key").try_into().unwrap(),
-        field(&vectors, "parameter").try_into().unwrap(),
-    );
     let pk = PublicKey(field(&vectors, "public_key").try_into().unwrap());
-    assert_eq!(sk.public_key(), pk);
     let cases = vectors["signatures"].as_array().unwrap();
     assert!(!cases.is_empty());
     for v in cases {
@@ -155,7 +171,6 @@ fn reference_key_is_reproduced() {
         bytes.extend(field(v, "elements"));
         bytes.extend(field(v, "path"));
         let sig = xmss::Signature(bytes.try_into().unwrap());
-        assert_eq!(sk.sign_at(leaf, &message).unwrap(), sig);
         assert_eq!(sig.verify(&pk, &message), Ok(()));
         let mut other = message;
         other[0] ^= 1;
@@ -167,13 +182,13 @@ fn reference_key_is_reproduced() {
 fn winternitz_roundtrip() {
     let messages = [message(b""), message(b"hello"), [0x55; 32], [0xff; 32]];
     for (i, m) in messages.iter().enumerate() {
-        let sk = winternitz::SecretKey::new(seed(i as u8), parameter(i as u8));
+        let sk = key::<winternitz::SecretKey>(i as u8);
         let pk = sk.public_key();
-        let sig = sk.sign_at(0, m).unwrap();
+        let sig = sign(&sk, 0, m);
         assert_eq!(sig.verify(&pk, m), Ok(()));
-        let other = winternitz::SecretKey::new(seed(9), parameter(9)).public_key();
+        let other = key::<winternitz::SecretKey>(9).public_key();
         assert_eq!(sig.verify(&other, m), Err(Error::InvalidSignature));
-        assert!(sk.sign_at(1, m).is_none());
+        assert!(sk.sign_at(1, m, &[0; SALT_LENGTH]).is_none());
         assert_eq!(
             sig.verify(&pk, &message(b"other")),
             Err(Error::InvalidSignature)
@@ -183,12 +198,12 @@ fn winternitz_roundtrip() {
 
 #[test]
 fn xmss_roundtrip_every_leaf() {
-    let sk = xmss::SecretKey::new(seed(3), parameter(3));
+    let sk = key::<xmss::SecretKey>(3);
     let pk = sk.public_key();
-    let other = xmss::SecretKey::new(seed(4), parameter(4)).public_key();
+    let other = key::<xmss::SecretKey>(4).public_key();
     for leaf in 0..xmss::LEAVES {
         let m = message(&leaf.to_le_bytes());
-        let sig = sk.sign_at(leaf, &m).unwrap();
+        let sig = sign(&sk, leaf, &m);
         assert_eq!(sig.leaf(), leaf);
         assert_eq!(sig.verify(&pk, &m), Ok(()));
         assert_eq!(sig.verify(&other, &m), Err(Error::InvalidSignature));
@@ -197,10 +212,13 @@ fn xmss_roundtrip_every_leaf() {
             Err(Error::InvalidSignature)
         );
     }
-    assert!(sk.sign_at(xmss::LEAVES, &message(b"")).is_none());
+    assert!(
+        sk.sign_at(xmss::LEAVES, &message(b""), &[0; SALT_LENGTH])
+            .is_none()
+    );
     // Relabelled to another leaf: the path no longer closes.
     let m = message(b"m");
-    let mut sig = sk.sign_at(5, &m).unwrap();
+    let mut sig = sign(&sk, 5, &m);
     sig.0[..4].copy_from_slice(&6u32.to_be_bytes());
     assert_eq!(sig.verify(&pk, &m), Err(Error::InvalidSignature));
     sig.0[..4].copy_from_slice(&xmss::LEAVES.to_be_bytes());
@@ -210,9 +228,9 @@ fn xmss_roundtrip_every_leaf() {
 #[test]
 fn tampering_is_rejected() {
     let m = message(b"tamper");
-    let sk = winternitz::SecretKey::new(seed(2), parameter(2));
+    let sk = key::<winternitz::SecretKey>(2);
     let pk = sk.public_key();
-    let sig = sk.sign_at(0, &m).unwrap();
+    let sig = sign(&sk, 0, &m);
     for i in 0..winternitz::SIGNATURE_LENGTH {
         let mut t = sig;
         t.0[i] ^= 1;
@@ -229,9 +247,9 @@ fn tampering_is_rejected() {
         assert_eq!(sig.verify(&pk, &t), Err(Error::InvalidSignature));
     }
 
-    let sk = xmss::SecretKey::new(seed(2), parameter(2));
+    let sk = key::<xmss::SecretKey>(2);
     let pk = sk.public_key();
-    let sig = sk.sign_at(77, &m).unwrap();
+    let sig = sign(&sk, 77, &m);
     for i in 0..xmss::SIGNATURE_LENGTH {
         let mut t = sig;
         t.0[i] ^= 1;
@@ -287,8 +305,8 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// Key-file offset of the next leaf: version, height, seed, parameter.
-const NEXT_LEAF: usize = 2 + 32 + PARAMETER_LENGTH;
+/// Key-file offset of the next leaf: version, height, parameter.
+const NEXT_LEAF: usize = 2 + PARAMETER_LENGTH;
 
 /// The signer's rules: one instance per file, no open without a file, the
 /// last message repeated for free, and foreign, truncated, behind-the-chain
@@ -301,13 +319,10 @@ fn signer_owns_leaf_allocation() {
     let path = dir.join("tree.key");
     let (a, b, y, z) = (message(b"a"), message(b"b"), message(b"y"), message(b"z"));
 
-    let mut signer = Tree::create(&path, seed(8), parameter(8)).unwrap();
+    let mut signer = Tree::create(&path).unwrap();
     let pk = signer.public_key();
     assert_eq!(signer.remaining(), xmss::LEAVES);
-    assert!(matches!(
-        Tree::create(&path, seed(8), parameter(8)),
-        Err(SignerError::Locked)
-    ));
+    assert!(matches!(Tree::create(&path), Err(SignerError::Locked)));
     assert!(matches!(Tree::open(&path), Err(SignerError::Locked)));
 
     let sig_a = signer.sign(&a).unwrap();
@@ -315,13 +330,11 @@ fn signer_owns_leaf_allocation() {
     assert_eq!(sig_a.verify(&pk, &a), Ok(()));
     assert_eq!(signer.sign(&a).unwrap(), sig_a);
     assert_eq!(signer.remaining(), xmss::LEAVES - 1);
-    assert_eq!(signer.sign(&b).unwrap().leaf(), 1);
+    let sig_b = signer.sign(&b).unwrap();
+    assert_eq!(sig_b.leaf(), 1);
     drop(signer);
 
-    assert!(matches!(
-        Tree::create(&path, seed(8), parameter(8)),
-        Err(SignerError::Exists)
-    ));
+    assert!(matches!(Tree::create(&path), Err(SignerError::Exists)));
     assert!(matches!(
         Signer::<winternitz::SecretKey>::open(&path),
         Err(SignerError::Corrupt)
@@ -334,7 +347,7 @@ fn signer_owns_leaf_allocation() {
     // Restart: continue at the record; an older message is a new leaf.
     let mut signer = Tree::open(&path).unwrap();
     assert_eq!(signer.next_leaf(), 2);
-    assert_eq!(signer.sign(&b).unwrap().leaf(), 1);
+    assert_eq!(signer.sign(&b).unwrap(), sig_b);
     assert_eq!(signer.sign(&a).unwrap().leaf(), 2);
     drop(signer);
     assert!(matches!(
@@ -367,6 +380,12 @@ fn signer_owns_leaf_allocation() {
     // Last leaf: one more message, then only that one.
     let mut last = record.clone();
     last[NEXT_LEAF..NEXT_LEAF + 4].copy_from_slice(&(xmss::LEAVES - 1).to_be_bytes());
+    let accepted = salt(
+        &last[2..20],
+        xmss::LEAVES - 2,
+        &last[25..57].try_into().unwrap(),
+    );
+    last[57..78].copy_from_slice(&accepted);
     std::fs::write(&path, &last).unwrap();
     let mut signer = Tree::open(&path).unwrap();
     assert_eq!(signer.remaining(), 1);
@@ -379,7 +398,7 @@ fn signer_owns_leaf_allocation() {
 
     // The one-leaf instance.
     let path = dir.join("once.key");
-    let mut once = Signer::<winternitz::SecretKey>::create(&path, seed(8), parameter(8)).unwrap();
+    let mut once = Signer::<winternitz::SecretKey>::create(&path).unwrap();
     let s = once.sign(&a).unwrap();
     assert_eq!(s.verify(&once.public_key(), &a), Ok(()));
     assert_eq!(once.sign(&a).unwrap(), s);
@@ -412,7 +431,7 @@ fn lock_dies_with_its_holder() {
     type Once = Signer<winternitz::SecretKey>;
     let dir = temp_dir("holder");
     let path = dir.join("once.key");
-    drop(Once::create(&path, seed(6), parameter(6)).unwrap());
+    drop(Once::create(&path).unwrap());
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "tests::hold_key_file", "--nocapture"])
         .env("SOLANA_WINTERNITZ_HOLD", &path)
@@ -428,166 +447,92 @@ fn lock_dies_with_its_holder() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Vector 1's key file after its one signature; the TypeScript tests open
-/// the same bytes.
-const KEY_FILE: &[u8] = include_bytes!("../tests/winternitz.key");
-
-const VECTORS: &str = include_str!("../tests/vectors.json");
-
-/// Both packages must reproduce this corpus byte for byte.
+/// Historical Rust/TypeScript wire fixtures; no legacy key derivation is retained.
 #[test]
-fn vectors_are_reproduced() {
-    let vectors: Value = serde_json::from_str(VECTORS).unwrap();
+fn historical_vectors_verify() {
+    let vectors: Value = serde_json::from_str(include_str!("../tests/vectors.json")).unwrap();
     let field = |v: &Value, k: &str| hex(v[k].as_str().unwrap());
-    let msg = |v: &Value| -> [u8; MESSAGE_LENGTH] { field(v, "message").try_into().unwrap() };
-    let ots = vectors["winternitz"].as_array().unwrap();
-    let tree = vectors["xmss"].as_array().unwrap();
-    assert!(!ots.is_empty() && !tree.is_empty());
-    for v in ots {
-        let sk = winternitz::SecretKey::new(
-            field(v, "seed").try_into().unwrap(),
-            field(v, "parameter").try_into().unwrap(),
-        );
+    for v in vectors["winternitz"].as_array().unwrap() {
         let pk = PublicKey(field(v, "public_key").try_into().unwrap());
-        let signature = winternitz::Signature(field(v, "signature").try_into().unwrap());
-        assert_eq!(sk.public_key(), pk);
-        assert_eq!(sk.sign_at(0, &msg(v)).unwrap(), signature);
-        assert_eq!(signature.verify(&pk, &msg(v)), Ok(()));
+        let message = field(v, "message").try_into().unwrap();
+        let sig = winternitz::Signature(field(v, "signature").try_into().unwrap());
+        assert_eq!(sig.verify(&pk, &message), Ok(()));
     }
-    // `tests/sbpf.rs` embeds vector 1 and rejects vector 0's message with it.
-    assert_eq!(
-        winternitz::Signature(field(&ots[1], "signature").try_into().unwrap()).verify(
-            &PublicKey(field(&ots[1], "public_key").try_into().unwrap()),
-            &msg(&ots[0])
-        ),
-        Err(Error::InvalidSignature)
-    );
-    let dir = temp_dir("fixture");
-    std::fs::write(dir.join("once.key"), KEY_FILE).unwrap();
-    let mut once = crate::Signer::<winternitz::SecretKey>::open(dir.join("once.key")).unwrap();
-    let v = &ots[1];
-    assert_eq!(
-        once.public_key(),
-        PublicKey(field(v, "public_key").try_into().unwrap())
-    );
-    assert_eq!(once.remaining(), 0);
-    assert_eq!(
-        once.sign(&msg(v)).unwrap().0.to_vec(),
-        field(v, "signature")
-    );
-    drop(once);
-    std::fs::remove_dir_all(&dir).unwrap();
-    let mut keys: Vec<(Vec<u8>, xmss::SecretKey)> = Vec::new();
-    for v in tree {
-        let seed = field(v, "seed");
-        if keys.iter().all(|(s, _)| *s != seed) {
-            keys.push((
-                seed.clone(),
-                xmss::SecretKey::new(
-                    seed.as_slice().try_into().unwrap(),
-                    field(v, "parameter").try_into().unwrap(),
-                ),
-            ));
-        }
-        let sk = &keys.iter().find(|(s, _)| *s == seed).unwrap().1;
-        let leaf = v["leaf"].as_u64().unwrap() as u32;
+    for v in vectors["xmss"].as_array().unwrap() {
         let pk = PublicKey(field(v, "public_key").try_into().unwrap());
-        let signature = xmss::Signature(field(v, "signature").try_into().unwrap());
-        assert_eq!(sk.public_key(), pk);
-        assert_eq!(sk.sign_at(leaf, &msg(v)).unwrap(), signature);
-        assert_eq!(signature.verify(&pk, &msg(v)), Ok(()));
+        let message = field(v, "message").try_into().unwrap();
+        let sig = xmss::Signature(field(v, "signature").try_into().unwrap());
+        assert_eq!(sig.verify(&pk, &message), Ok(()));
     }
 }
 
-/// `cargo test --lib regenerate_vectors -- --ignored` rewrites the corpus
-/// and the key-file fixture.
+/// Explicit test chain starts and accepted salts pin signing in both languages.
+#[test]
+fn sampled_vectors_are_reproduced() {
+    let vectors: Value = serde_json::from_str(include_str!("../tests/sampled.json")).unwrap();
+    let sk = key::<xmss::SecretKey>(7);
+    let pk = PublicKey(
+        hex(vectors["public_key"].as_str().unwrap())
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(sk.public_key(), pk);
+    for v in vectors["signatures"].as_array().unwrap() {
+        let leaf = v["leaf"].as_u64().unwrap() as u32;
+        let m = message(&leaf.to_le_bytes());
+        let sig = xmss::Signature(hex(v["signature"].as_str().unwrap()).try_into().unwrap());
+        assert_eq!(sign(&sk, leaf, &m), sig);
+        assert_eq!(sig.verify(&pk, &m), Ok(()));
+    }
+    let dir = temp_dir("fixture");
+    let path = dir.join("once.key");
+    std::fs::write(&path, include_bytes!("../tests/winternitz.key")).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut once = crate::Signer::<winternitz::SecretKey>::open(&path).unwrap();
+    let m = before[25..57].try_into().unwrap();
+    let expected = hex(vectors["one_time_signature"].as_str().unwrap());
+    assert_eq!(once.sign(&m).unwrap().0.as_slice(), expected);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    drop(once);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn raw_keys_require_all_chain_starts() {
+    assert!(winternitz::SecretKey::new(&[0; 32], parameter(0)).is_none());
+    assert!(xmss::SecretKey::new(&[0; 828], parameter(0)).is_none());
+    let key = key::<winternitz::SecretKey>(1);
+    let m = message(b"bad salt");
+    let bad = (0u32..)
+        .find_map(|counter| {
+            let mut salt = [0; SALT_LENGTH];
+            salt[..4].copy_from_slice(&counter.to_le_bytes());
+            crate::encode(&salt, key.public_key().parameter(), 0, &m)
+                .is_none()
+                .then_some(salt)
+        })
+        .unwrap();
+    assert!(key.sign_at(0, &m, &bad).is_none());
+}
+
+/// Regenerate explicit-input vectors and the small shared state fixture.
 #[test]
 #[ignore]
-fn regenerate_vectors() {
-    // Three named cases, then seven under one xmss key at leaves 2 to 8.
-    let named_seed = |prefix: &[u8], i: u8| {
-        let mut s = [0u8; 32];
-        s[..prefix.len()].copy_from_slice(prefix);
-        s[31] = i;
-        s
-    };
-    type Case = ([u8; 32], [u8; PARAMETER_LENGTH], u32, [u8; MESSAGE_LENGTH]);
-    let mut cases: Vec<Case> = std::vec![
-        (named_seed(b"", 0), parameter(0), 0, [0; MESSAGE_LENGTH]),
-        (
-            named_seed(b"blueshift", 1),
-            parameter(1),
-            1,
-            hash::hashv(&[b"rotate to 11111111111111111111111111111111"]),
-        ),
-        (
-            named_seed(&[0x42; 32], 2),
-            parameter(2),
-            xmss::LEAVES - 1,
-            [0xff; MESSAGE_LENGTH]
-        ),
-    ];
-    for j in 0..7u8 {
-        cases.push((
-            [j + 10; 32],
-            parameter(j + 10),
-            2 + u32::from(j),
-            core::array::from_fn(|b| (b as u8).wrapping_mul(j + 1)),
-        ));
-    }
-    let ots: Vec<Value> = cases
-        .iter()
-        .map(|(seed, parameter, _, message)| {
-            let sk = winternitz::SecretKey::new(*seed, *parameter);
-            serde_json::json!({
-                "seed": to_hex(seed),
-                "parameter": to_hex(parameter),
-                "message": to_hex(message),
-                "public_key": to_hex(&sk.public_key().0),
-                "signature": to_hex(&sk.sign_at(0, message).unwrap().0),
-            })
-        })
-        .collect();
-    // One xmss key for the unnamed cases: the corpus pins leaves, not keys.
-    let shared = xmss::SecretKey::new(seed(3), parameter(3));
-    let tree: Vec<Value> = cases
-        .iter()
-        .enumerate()
-        .map(|(i, (seed, parameter, leaf, message))| {
-            let named;
-            let (sk, seed, parameter) = if i < 3 {
-                named = xmss::SecretKey::new(*seed, *parameter);
-                (&named, *seed, *parameter)
-            } else {
-                (&shared, self::seed(3), self::parameter(3))
-            };
-            serde_json::json!({
-                "seed": to_hex(&seed),
-                "parameter": to_hex(&parameter),
-                "leaf": leaf,
-                "message": to_hex(message),
-                "public_key": to_hex(&sk.public_key().0),
-                "signature": to_hex(&sk.sign_at(*leaf, message).unwrap().0),
-            })
-        })
-        .collect();
-    std::fs::write(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors.json"),
-        serde_json::to_string_pretty(&serde_json::json!({ "winternitz": ots, "xmss": tree }))
-            .unwrap()
-            + "\n",
-    )
-    .unwrap();
+fn regenerate_sampled_vectors() {
+    let sk = key::<xmss::SecretKey>(7);
+    let signatures: Vec<Value> = [0, 1, 127, 128, 255u32].into_iter().map(|leaf| {
+        serde_json::json!({ "leaf": leaf, "signature": to_hex(&sign(&sk, leaf, &message(&leaf.to_le_bytes())).0) })
+    }).collect();
     let dir = temp_dir("regenerate");
     let path = dir.join("once.key");
-    let mut once =
-        crate::Signer::<winternitz::SecretKey>::create(&path, cases[1].0, cases[1].1).unwrap();
-    once.sign(&cases[1].3).unwrap();
+    let mut once = crate::Signer::<winternitz::SecretKey>::create(&path).unwrap();
+    let sig = once.sign(&message(b"sampled fixture")).unwrap();
     drop(once);
-    std::fs::copy(
-        &path,
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/winternitz.key"),
-    )
-    .unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::copy(&path, "tests/winternitz.key").unwrap();
+    std::fs::write("tests/sampled.json", serde_json::to_string_pretty(&serde_json::json!({
+        "test_inputs": "Public test data only: chain-start byte i = (i mod 251) xor 7; P = 18 bytes of 0x57; message = leaf LE32 padded to 32 bytes; salt = first accepted counter LE32 padded to 21 bytes.",
+        "public_key": to_hex(&sk.public_key().0), "signatures": signatures,
+        "one_time_signature": to_hex(&sig.0),
+    })).unwrap() + "\n").unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
 }

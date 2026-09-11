@@ -1,9 +1,11 @@
-import { expect, test } from 'bun:test';
+import { expect, test, spyOn } from 'bun:test';
 import vectors from '../../../tests/vectors.json' with { type: 'json' };
+import sampled from '../../../tests/sampled.json' with { type: 'json' };
+import * as crypto from 'node:crypto';
 import reference from '../../../tests/hash-sig.json' with { type: 'json' };
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MESSAGE_LENGTH, PARAMETER_LENGTH, PUBLIC_KEY_LENGTH, PublicKey, Signer, winternitz, xmss } from '../src/index.js';
@@ -16,23 +18,15 @@ test('the hash is Keccak-256, not SHA3-256', () => {
   expect(hex(keccak_256(new Uint8Array()))).toBe('c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470');
 });
 
-test.each(vectors.winternitz)('winternitz matches the Rust crate', ({ seed, parameter, message, public_key, signature }) => {
-  const key = winternitz.SecretKey.new(fromHex(seed), fromHex(parameter));
-  expect(hex(key.publicKey.bytes)).toBe(public_key);
-  expect(hex(key.signAt(0, fromHex(message)).bytes)).toBe(signature);
+test.each(vectors.winternitz)('historical winternitz signatures verify', ({ message, public_key, signature }) => {
   winternitz.Signature.from(fromHex(signature)).verify(PublicKey.from(fromHex(public_key)), fromHex(message));
 });
 
-// hash-sig's key at these type parameters, hash swapped to Keccak-256: its public key and signatures byte for byte.
-const referenceKey = xmss.SecretKey.new(fromHex(reference.prf_key), fromHex(reference.parameter));
-test('the hash-sig public key is reproduced', () => {
-  expect(hex(referenceKey.publicKey.bytes)).toBe(reference.public_key);
-});
-test.each(reference.signatures)('the hash-sig signature at leaf $leaf is reproduced', ({ leaf, message, salt, elements, path }) => {
+// Independently generated reference signatures check verification; no PRF is retained.
+test.each(reference.signatures)('the hash-sig signature at leaf $leaf verifies', ({ leaf, message, salt, elements, path }) => {
   const bytes = new Uint8Array(4 + (salt.length + elements.length + path.length) / 2);
   new DataView(bytes.buffer).setUint32(0, leaf, false);
   bytes.set(fromHex(salt + elements + path), 4);
-  expect(hex(referenceKey.signAt(leaf, fromHex(message)).bytes)).toBe(hex(bytes));
   const signature = xmss.Signature.from(bytes);
   const key = PublicKey.from(fromHex(reference.public_key));
   expect(signature.leaf).toBe(leaf);
@@ -42,16 +36,34 @@ test.each(reference.signatures)('the hash-sig signature at leaf $leaf is reprodu
   expect(() => signature.verify(key, other)).toThrow();
 });
 
-const trees = new Map<string, xmss.SecretKey>();
-
-test.each(vectors.xmss)('xmss matches the Rust crate at leaf $leaf', ({ seed, parameter, leaf, message, public_key, signature }) => {
-  const key = trees.get(seed) ?? xmss.SecretKey.new(fromHex(seed), fromHex(parameter));
-  trees.set(seed, key);
-  expect(hex(key.publicKey.bytes)).toBe(public_key);
-  const sig = key.signAt(leaf, fromHex(message));
-  expect(sig.leaf).toBe(leaf);
-  expect(hex(sig.bytes)).toBe(signature);
+test.each(vectors.xmss)('historical xmss signatures verify at leaf $leaf', ({ message, public_key, signature }) => {
   xmss.Signature.from(fromHex(signature)).verify(PublicKey.from(fromHex(public_key)), fromHex(message));
+});
+
+// Deliberately non-random public inputs, matching the Rust fixture generator.
+function acceptedSalt(parameter: Uint8Array, leaf: number, message: Uint8Array): Uint8Array {
+  const input = new Uint8Array(76);
+  input.set(parameter, 21);
+  input[39] = 2;
+  new DataView(input.buffer).setUint32(40, leaf, true);
+  input.set(message, 44);
+  for (let counter = 0; ; counter++) {
+    new DataView(input.buffer).setUint32(0, counter, true);
+    const hash = keccak_256(input);
+    let sum = 0;
+    for (const b of hash.subarray(0, 18)) sum += (b & 15) + (b >> 4);
+    if (sum === 297) return input.slice(0, 21);
+  }
+}
+
+const sampledTree = xmss.SecretKey.new(Uint8Array.from({ length: 256 * 828 }, (_, i) => (i % 251) ^ 7), new Uint8Array(18).fill(0x57));
+test.each(sampled.signatures)('explicit chain starts reproduce Rust signing at leaf $leaf', ({ leaf, signature }) => {
+  const message = new Uint8Array(32);
+  new DataView(message.buffer).setUint32(0, leaf, true);
+  const sig = sampledTree.signAt(leaf, message, acceptedSalt(sampledTree.publicKey.parameter, leaf, message));
+  expect(hex(sampledTree.publicKey.bytes)).toBe(sampled.public_key);
+  expect(hex(sig.bytes)).toBe(signature);
+  sig.verify(sampledTree.publicKey, message);
 });
 
 test('every single-byte change to a signature, key or message is rejected', () => {
@@ -86,13 +98,11 @@ test('every single-byte change to a signature, key or message is rejected', () =
 test('the signer owns leaf allocation', () => {
   const dir = mkdtempSync(join(tmpdir(), 'solana-winternitz-'));
   const path = join(dir, 'tree.key');
-  const seed = new Uint8Array(32);
-  const parameter = new Uint8Array(PARAMETER_LENGTH).fill(0x50);
   const m = (n: number) => new Uint8Array(MESSAGE_LENGTH).fill(n);
 
-  const signer = Signer.create(xmss.SecretKey, path, seed, parameter);
+  const signer = Signer.create(xmss.SecretKey, path);
   expect(signer.remaining).toBe(xmss.LEAVES);
-  expect(() => Signer.create(xmss.SecretKey, path, seed, parameter)).toThrow('held by another signer');
+  expect(() => Signer.create(xmss.SecretKey, path)).toThrow('held by another signer');
   expect(() => Signer.open(xmss.SecretKey, path)).toThrow('held by another signer');
 
   const a = signer.sign(m(1));
@@ -100,18 +110,19 @@ test('the signer owns leaf allocation', () => {
   a.verify(signer.publicKey, m(1));
   expect(signer.sign(m(1)).bytes).toEqual(a.bytes);
   expect(signer.remaining).toBe(xmss.LEAVES - 1);
-  expect(signer.sign(m(2)).leaf).toBe(1);
+  const b = signer.sign(m(2));
+  expect(b.leaf).toBe(1);
   signer.close();
   expect(() => signer.sign(m(3))).toThrow('closed');
 
-  expect(() => Signer.create(xmss.SecretKey, path, seed, parameter)).toThrow('already exists');
+  expect(() => Signer.create(xmss.SecretKey, path)).toThrow('already exists');
   expect(() => Signer.open(winternitz.SecretKey, path)).toThrow('not a record of this instance');
   expect(() => Signer.open(xmss.SecretKey, join(dir, 'none.key'))).toThrow('no key file');
 
   // Restart: continue at the record; an older message is a new leaf.
   const again = Signer.open(xmss.SecretKey, path);
   expect(again.nextLeaf).toBe(2);
-  expect(again.sign(m(2)).leaf).toBe(1);
+  expect(again.sign(m(2)).bytes).toEqual(b.bytes);
   expect(again.sign(m(1)).leaf).toBe(2);
   again.close();
   expect(() => Signer.open(xmss.SecretKey, path).floor(4)).toThrow('behind the chain');
@@ -129,13 +140,14 @@ test('the signer owns leaf allocation', () => {
   writeFileSync(path, record.subarray(0, record.length - 1));
   expect(() => Signer.open(xmss.SecretKey, path)).toThrow('not a record of this instance');
   const contradiction = Buffer.from(record);
-  contradiction.writeUInt32BE(0, 2 + 32 + PARAMETER_LENGTH);
+  contradiction.writeUInt32BE(0, 2 + PARAMETER_LENGTH);
   writeFileSync(path, contradiction);
   expect(() => Signer.open(xmss.SecretKey, path)).toThrow('not a record of this instance');
 
   // Last leaf: one more message, then only that one.
   const last = Buffer.from(record);
-  last.writeUInt32BE(xmss.LEAVES - 1, 2 + 32 + PARAMETER_LENGTH);
+  last.writeUInt32BE(xmss.LEAVES - 1, 2 + PARAMETER_LENGTH);
+  last.set(acceptedSalt(last.subarray(2, 20), xmss.LEAVES - 2, last.subarray(25, 57)), 57);
   writeFileSync(path, last);
   const s = Signer.open(xmss.SecretKey, path);
   expect(s.remaining).toBe(1);
@@ -147,7 +159,7 @@ test('the signer owns leaf allocation', () => {
   s.close();
 
   // The one-leaf instance.
-  const once = Signer.create(winternitz.SecretKey, join(dir, 'once.key'), seed, parameter);
+  const once = Signer.create(winternitz.SecretKey, join(dir, 'once.key'));
   const sig = once.sign(m(5));
   sig.verify(once.publicKey, m(5));
   expect(once.sign(m(5)).bytes).toEqual(sig.bytes);
@@ -159,7 +171,7 @@ test('the signer owns leaf allocation', () => {
 test('the lock dies with its holder', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'solana-winternitz-'));
   const path = join(dir, 'once.key');
-  Signer.create(winternitz.SecretKey, path, new Uint8Array(32), new Uint8Array(PARAMETER_LENGTH)).close();
+  Signer.create(winternitz.SecretKey, path).close();
   const source = new URL('../src/index.ts', import.meta.url).pathname;
   const holder = spawn(process.execPath, [
     '-e',
@@ -180,11 +192,11 @@ test('the key file written by the Rust crate opens here', () => {
   const dir = mkdtempSync(join(tmpdir(), 'solana-winternitz-'));
   const path = join(dir, 'once.key');
   writeFileSync(path, readFileSync(new URL('../../../tests/winternitz.key', import.meta.url)));
-  const w = vectors.winternitz[1]!;
+  const record = readFileSync(path);
   const once = Signer.open(winternitz.SecretKey, path);
-  expect(hex(once.publicKey.bytes)).toBe(w.public_key);
   expect(once.remaining).toBe(0);
-  expect(hex(once.sign(fromHex(w.message)).bytes)).toBe(w.signature);
+  expect(hex(once.sign(record.subarray(25, 57)).bytes)).toBe(sampled.one_time_signature);
+  expect(readFileSync(path)).toEqual(record);
   once.close();
   rmSync(dir, { recursive: true });
 });
@@ -192,13 +204,63 @@ test('the key file written by the Rust crate opens here', () => {
 test('inputs are range-checked', () => {
   const p = new Uint8Array(PARAMETER_LENGTH);
   const m = new Uint8Array(MESSAGE_LENGTH);
-  expect(() => xmss.SecretKey.new(new Uint8Array(32), p).signAt(xmss.LEAVES, m)).toThrow('leaf');
-  expect(() => winternitz.SecretKey.new(new Uint8Array(32), p).signAt(0, new Uint8Array(31))).toThrow('expected 32 bytes');
-  expect(() => winternitz.SecretKey.new(new Uint8Array(32), p).signAt(1, m)).toThrow('leaf');
+  const salt = new Uint8Array(21);
+  const key = winternitz.SecretKey.new(new Uint8Array(828), p);
+  expect(() => sampledTree.signAt(xmss.LEAVES, m, salt)).toThrow('leaf');
+  expect(() => key.signAt(0, new Uint8Array(31), salt)).toThrow('expected 32 bytes');
+  expect(() => key.signAt(1, m, salt)).toThrow('leaf');
+  expect(() => key.signAt(0, m, new Uint8Array(20))).toThrow('expected 21 bytes');
   expect(() => winternitz.Signature.from(new Uint8Array(849)).verify(PublicKey.from(new Uint8Array(41)), new Uint8Array(33))).toThrow('expected 32 bytes');
-  expect(() => winternitz.SecretKey.new(new Uint8Array(31), p)).toThrow('expected 32 bytes');
-  expect(() => winternitz.SecretKey.new(new Uint8Array(32), new Uint8Array(17))).toThrow('expected 18 bytes');
+  expect(() => winternitz.SecretKey.new(new Uint8Array(32), p)).toThrow('expected 828 bytes');
+  expect(() => xmss.SecretKey.new(new Uint8Array(828), p)).toThrow('expected 211968 bytes');
+  expect(() => winternitz.SecretKey.new(new Uint8Array(828), new Uint8Array(17))).toThrow('expected 18 bytes');
   expect(() => winternitz.Signature.from(new Uint8Array(848))).toThrow('expected 849 bytes');
   expect(() => xmss.Signature.from(new Uint8Array(1036))).toThrow('expected 1037 bytes');
   expect(() => PublicKey.from(new Uint8Array(40))).toThrow('expected 41 bytes');
+});
+
+test('entropy failure, salt exhaustion, and write failure release no signature', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'solana-winternitz-'));
+  const path = join(dir, 'once.key');
+  const signer = Signer.create(winternitz.SecretKey, path);
+  const before = readFileSync(path);
+  const m = new Uint8Array(32);
+  const randomFill = crypto.randomFillSync;
+  const fill = spyOn(crypto, 'randomFillSync');
+  try {
+    fill.mockImplementation(() => { throw new Error('entropy unavailable'); });
+    expect(() => signer.sign(m)).toThrow('entropy unavailable');
+    expect(signer.nextLeaf).toBe(0);
+    expect(readFileSync(path)).toEqual(before);
+    // One known rejected candidate repeated K times deterministically forces exhaustion.
+    const bad = new Uint8Array(21);
+    const input = new Uint8Array(76);
+    input.set(signer.publicKey.parameter, 21);
+    input[39] = 2;
+    input.set(m, 44);
+    for (let counter = 0; ; counter++) {
+      new DataView(bad.buffer).setUint32(0, counter, true);
+      input.set(bad, 0);
+      const sum = keccak_256(input).subarray(0, 18).reduce((n, b) => n + (b & 15) + (b >> 4), 0);
+      if (sum !== 297) break;
+    }
+    fill.mockImplementation((buffer) => { new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength).set(bad); return buffer; });
+    expect(() => signer.sign(m)).toThrow('4096 salts missed');
+    expect(signer.nextLeaf).toBe(0);
+    expect(readFileSync(path)).toEqual(before);
+    fill.mockImplementation(randomFill);
+    mkdirSync(`${path}.tmp`);
+    expect(() => signer.sign(m)).toThrow();
+    expect(() => signer.sign(m)).toThrow('closed');
+    expect(readFileSync(path)).toEqual(before);
+    rmSync(`${path}.tmp`, { recursive: true });
+    const again = Signer.open(winternitz.SecretKey, path);
+    const signature = again.sign(m);
+    fill.mockImplementation(() => { throw new Error('retry drew entropy'); });
+    expect(again.sign(m).bytes).toEqual(signature.bytes);
+    again.close();
+    const reopened = Signer.open(winternitz.SecretKey, path);
+    expect(reopened.sign(m).bytes).toEqual(signature.bytes);
+    reopened.close();
+  } finally { fill.mockRestore(); signer.close(); rmSync(dir, { recursive: true, force: true }); }
 });
