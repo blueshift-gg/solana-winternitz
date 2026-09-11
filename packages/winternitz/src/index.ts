@@ -482,55 +482,29 @@ export class Signer<S> {
 /**
  * The `.lock` sidecar, created exclusively and holding the owner's pid: the Rust crate's protocol byte for
  * byte, so each refuses a file the other holds. A sidecar because rename would orphan a lock on the record.
- * An empty or unreadable lock is held, its owner between creating it and writing its pid. A dead owner's
- * lock is renamed away before removal, so of two openers clearing it at once only one can go on to create.
+ * Removed on close. A lock left by a crashed process is removed by hand once its pid is confirmed dead, never
+ * by a signer: any automatic recovery reads the file and then acts on whatever is at that path, which a
+ * concurrent creator can have replaced in between.
  */
 function acquire(path: string): string {
   const lock = `${path}.lock`;
-  const locked = new Error(`the key file is locked (${lock})`);
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let fd: number;
-    try {
-      fd = openSync(lock, 'wx', 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      let owner: string;
-      try {
-        owner = readFileSync(lock, 'utf8');
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-        throw error;
-      }
-      const pid = Number(owner.trim());
-      if (!Number.isInteger(pid) || pid <= 0 || alive(pid)) throw locked;
-      try {
-        renameSync(lock, `${lock}.stale`);
-        unlinkSync(`${lock}.stale`);
-      } catch {
-        // Another opener cleared it first.
-      }
-      continue;
-    }
-    try {
-      writeSync(fd, String(process.pid));
-      closeSync(fd);
-    } catch (error) {
-      release(lock);
-      throw error;
-    }
-    return lock;
-  }
-  throw locked;
-}
-
-/** `kill(pid, 0)` delivers nothing and reports whether the process exists; `EPERM` means it exists under another user. */
-function alive(pid: number): boolean {
+  let fd: number;
   try {
-    process.kill(pid, 0);
-    return true;
+    fd = openSync(lock, 'wx', 0o600);
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error(`the key file is locked: held by another signer, or left by a dead one; remove ${lock} by hand once its pid is dead`);
+    }
+    throw error;
   }
+  try {
+    writeSync(fd, String(process.pid));
+    closeSync(fd);
+  } catch (error) {
+    release(lock);
+    throw error;
+  }
+  return lock;
 }
 
 function release(lock: string): void {

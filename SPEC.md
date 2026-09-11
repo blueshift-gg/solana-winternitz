@@ -123,20 +123,13 @@ message signed stored whole. `h` tags the instance so a file opens only
 under its own; it enters no derivation.
 
 The open signer holds `<file>.lock`, the same protocol in both packages:
-
-1. Create `<file>.lock` exclusively (`O_EXCL`, mode 0600) and write the
-   decimal pid of the process. On success the lock is held.
-2. If the file exists, read it. If the content is not a positive integer,
-   or names a live process (`kill(pid, 0)` succeeds or fails with
-   `EPERM`), refuse: the owner is alive or between creating the file and
-   writing its pid.
-3. Otherwise rename it to `<file>.lock.stale`, remove that, and go to
-   step 1 once more. A second existing file refuses.
-
-Release removes `<file>.lock`. Of two openers clearing a dead owner's
-lock at once, only the one whose rename succeeds can go on to create.
-Pids are meaningful within one pid namespace: signers of one file share a
-host.
+create it exclusively (`O_EXCL`, mode 0600) and write the decimal pid of
+the process; if it exists, refuse, whatever it holds. Release removes it.
+A signer never removes a lock it did not create: a lock left by a crashed
+process is removed by hand once the pid inside is confirmed dead, with
+no signer running. Any automatic recovery reads the file and then acts
+on whatever is at that path, which a concurrent creator can have
+replaced in between, so exclusion rests on the one atomic operation.
 
 ## Vectors
 

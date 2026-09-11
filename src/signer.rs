@@ -36,7 +36,8 @@ pub enum SignerError {
     Exists,
     /// `open` with no key file: a seed cannot say which leaves are spent.
     Missing,
-    /// Another signer holds the file.
+    /// `<file>.lock` exists: another signer holds the file, or a crashed
+    /// one left it. Remove it by hand once the pid inside is dead.
     Locked,
     /// Wrong length, version or instance height.
     Corrupt,
@@ -68,7 +69,9 @@ impl core::fmt::Display for SignerError {
             Self::Missing => f.write_str(
                 "no key file at this path: a seed alone cannot say which leaves are spent",
             ),
-            Self::Locked => f.write_str("the key file is held by another signer"),
+            Self::Locked => f.write_str(
+                "the key file is locked: held by another signer, or left by a dead one; remove the .lock file by hand once its pid is dead",
+            ),
             Self::Corrupt => f.write_str("the key file is not a record of this instance"),
             Self::BelowFloor { next_leaf, floor } => write!(
                 f,
@@ -282,9 +285,12 @@ fn options() -> fs::OpenOptions {
 }
 
 /// The `.lock` sidecar, created exclusively and holding the owner's pid:
-/// the TypeScript package's protocol byte for byte, so each refuses a file
-/// the other holds. A sidecar because rename would orphan a lock on the
-/// record. Removed on drop; a dead owner's is cleared by the next opener.
+/// the TypeScript package's protocol byte for byte, so each refuses a
+/// file the other holds. A sidecar because rename would orphan a lock on
+/// the record. Removed on drop. A lock left by a crashed process is
+/// removed by hand once its pid is confirmed dead, never by a signer: any
+/// automatic recovery reads the file and then acts on whatever is at that
+/// path, which a concurrent creator can have replaced in between.
 struct Lock(PathBuf);
 
 impl Drop for Lock {
@@ -293,58 +299,20 @@ impl Drop for Lock {
     }
 }
 
-/// An empty or unreadable lock is held: its owner is between creating it
-/// and writing its pid. A dead owner's lock is renamed away before removal,
-/// so of two openers clearing it at once only one can go on to create.
 fn lock(path: &Path) -> Result<Lock, SignerError> {
     let lock = sibling(path, ".lock");
-    for _ in 0..2 {
-        match options().write(true).create_new(true).open(&lock) {
-            Ok(mut file) => {
-                let held = Lock(lock);
-                file.write_all(std::format!("{}", std::process::id()).as_bytes())?;
-                return Ok(held);
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let owner = match fs::read_to_string(&lock) {
-            Ok(owner) => owner,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        };
-        match owner.trim().parse::<u32>() {
-            Ok(pid) if pid > 0 && !alive(pid) => {}
-            _ => return Err(SignerError::Locked),
-        }
-        let stale = sibling(path, ".lock.stale");
-        if fs::rename(&lock, &stale).is_ok() {
-            let _ = fs::remove_file(&stale);
-        }
-    }
-    Err(SignerError::Locked)
-}
-
-/// `kill(pid, 0)` delivers nothing and reports whether the process exists;
-/// `EPERM` means it exists under another user.
-#[cfg(unix)]
-fn alive(pid: u32) -> bool {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    let Ok(pid) = i32::try_from(pid) else {
-        return true;
-    };
-    // SAFETY: libc's `kill`, which std links on every unix target; signal 0
-    // performs only the existence and permission check.
-    (unsafe { kill(pid, 0) == 0 })
-        || io::Error::last_os_error().kind() == io::ErrorKind::PermissionDenied
-}
-
-/// No portable liveness check: an existing lock is held.
-#[cfg(not(unix))]
-fn alive(_pid: u32) -> bool {
-    true
+    let mut file =
+        options()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::AlreadyExists => SignerError::Locked,
+                _ => SignerError::Io(error),
+            })?;
+    let held = Lock(lock);
+    file.write_all(std::format!("{}", std::process::id()).as_bytes())?;
+    Ok(held)
 }
 
 /// A rename is durable only once its directory is synced.

@@ -117,13 +117,13 @@ test('the signer owns leaf allocation', () => {
 
   // Interrupted write: stale temp ignored, truncated record refused.
   writeFileSync(`${path}.tmp`, 'garbage');
-  // The lock file: a live pid, an empty file and garbage all refuse; a dead pid is cleared; close removes it.
-  for (const owner of [String(process.pid), '', 'abc']) {
+  // The lock file: whatever it holds, a live pid, a dead one, nothing or garbage, an existing lock refuses;
+  // only its removal by hand opens the file again; close removes it.
+  for (const owner of [String(process.pid), '999999999', '', 'abc']) {
     writeFileSync(`${path}.lock`, owner);
     expect(() => Signer.open(xmss.SecretKey, path)).toThrow('locked');
     rmSync(`${path}.lock`);
   }
-  writeFileSync(`${path}.lock`, '999999999');
   const after = Signer.open(xmss.SecretKey, path);
   expect(after.nextLeaf).toBe(3);
   expect(readFileSync(`${path}.lock`, 'utf8')).toBe(String(process.pid));

@@ -88,9 +88,10 @@ locks. The key file is the key: seed, public parameter, next leaf and
 last message in 89 bytes, so back up the file, not the seed. `create`
 takes a fresh 32-byte seed and a fresh 18-byte parameter, the paper's
 `sk` and `P`, and refuses an existing file. `open` takes only a file.
-One process holds a file at a time, through a `.lock` sidecar carrying
-its pid. `signAt` and `sign_at` sign under an explicit leaf and record
-nothing; they exist for tests and vectors.
+One process holds a file at a time, through a `.lock` sidecar created
+exclusively; a lock left by a crash is removed by hand once the pid
+inside is dead, never by a signer. `signAt` and `sign_at` sign under an
+explicit leaf and record nothing; they exist for tests and vectors.
 
 ## Rules
 

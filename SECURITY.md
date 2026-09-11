@@ -255,10 +255,12 @@ crate enforces it and what §5 says about its violation.
   as spent before its signature is released, the last message is
   repeated rather than re-signed, a different message on a spent leaf is
   refused, and one process holds a key file at a time through a `.lock`
-  sidecar carrying its pid, the same protocol in both packages, so a file
-  held by one implementation is refused by the other. Pid files assume
-  one pid namespace: signers of one file share a host. `sign_at` bypasses
-  all of this and is for tests. Violation: leaf reuse, §5.
+  sidecar created exclusively, the same protocol in both packages, so a
+  file held by one implementation is refused by the other. No signer
+  removes a lock it did not create: a lock left by a crash is removed by
+  hand once its pid is confirmed dead and no signer runs, since any
+  automatic recovery races with a concurrent creator (§9). `sign_at`
+  bypasses all of this and is for tests. Violation: leaf reuse, §5.
 - **A2, integrity of the signer's record.** The record holds the seed,
   `P`, the next leaf and the last message; a copy older than the latest
   signature reintroduces A1's violation. Not detectable locally; a lower
@@ -311,8 +313,7 @@ and five signatures both packages reproduce byte for byte from its PRF
 key and parameter (`tests/hash-sig.json`); the vector corpus reproduced
 by two implementations sharing no code; the SBPF verifier under Mollusk
 against host-generated signatures, 34 331 and 35 971 CU; the lock
-protocol against a live pid, an empty file, garbage and a dead pid in
-both packages.
+protocol refusing an existing lock whatever it holds, in both packages.
 
 Checked outside CI through the public APIs: each package refuses a key
 file the other holds, in both acquisition orders, and opens it once
@@ -339,7 +340,12 @@ label in the PRF separating the two instances: rejected in favour of
 bound on the message becomes the application's `2^128` collision bound
 on its payload hash, the paper's own arrangement. An OS advisory lock on
 the sidecar: rejected, Node has none, and two protocols on one file let
-each implementation open a file the other held. Classical Winternitz
+each implementation open a file the other held. Automatic recovery of a
+dead owner's lock by pid liveness and rename: rejected, two openers
+recovering at once let the slower one remove the faster one's fresh
+lock, reproduced through the public APIs; without an atomic
+compare-and-remove, only exclusive creation with no recovery is
+race-free. Classical Winternitz
 with checksum chains, Construction 5: more chains and variable verifier
 work. Resuming a restored seed at a margin above the verifier's last
 accepted leaf: rejected, a guess (A2).
