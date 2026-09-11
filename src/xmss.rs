@@ -1,20 +1,15 @@
-//! Lifetime 256: one key, 256 one-time leaves under a Merkle tree. The
-//! public key is `root ‖ P`.
-//!
-//! Each signature names its leaf by epoch. A leaf signs once; the verifier
-//! cannot see history, so the program that verifies stores the last epoch
-//! used and accepts only strictly greater ones. A signature broadcast in a
-//! transaction that failed has still revealed its leaf: the signer must
-//! never reuse an epoch it has signed with, landed or not.
+//! Construction 3 at L = 2^8, public key `(root, P)`. The verifier cannot
+//! see history: the program enforces a leaf policy on the index (README)
+//! and [`crate::Signer`] enforces one message per leaf.
 
 use crate::{
     Chain, ELEMENTS_LENGTH, Error, NODE_LENGTH, PARAMETER_LENGTH, PublicKey, SALT_LENGTH, encode,
-    leaf, node,
+    leaf_hash, node,
 };
 
 pub const HEIGHT: usize = 8;
 pub const LEAVES: u32 = 1 << HEIGHT;
-/// `epoch (u32 LE) ‖ ρ ‖ σ_0 ‖ … ‖ σ_34 ‖ authentication path`.
+/// `(ep, ρ, σ_OTS, path_ep)` of Construction 3, `ep` as u32 LE.
 pub const SIGNATURE_LENGTH: usize = 4 + SALT_LENGTH + ELEMENTS_LENGTH + HEIGHT * NODE_LENGTH;
 
 const SALT: usize = 4;
@@ -25,30 +20,28 @@ const PATH: usize = ELEMENTS + ELEMENTS_LENGTH;
 pub struct Signature(pub [u8; SIGNATURE_LENGTH]);
 
 impl Signature {
-    /// The leaf this signature spends. The verifier must reject any epoch
-    /// at or below the last one accepted for the same key.
+    /// The paper's epoch: a counter, never a slot or the Solana epoch.
     #[inline(always)]
-    pub fn epoch(&self) -> u32 {
+    pub fn leaf(&self) -> u32 {
         u32::from_le_bytes(self.0[..SALT].try_into().unwrap())
     }
 
-    /// One message hash, 200 chain hashes, one leaf hash, 8 node hashes:
-    /// ~31k CU, the same for every accepted signature. A wrong message or
-    /// epoch rejects after the first hash; a wrong key after all of them.
+    /// Construction 3 Ver, then Construction 1 VerPath. Constant work for
+    /// an accepted signature: HMAC, 200 chain steps, leaf, 8 nodes, ~31k CU.
     #[inline]
     pub fn verify(&self, public_key: &PublicKey, message: &[u8]) -> Result<(), Error> {
-        let epoch = self.epoch();
-        if epoch >= LEAVES {
+        let leaf = self.leaf();
+        if leaf >= LEAVES {
             return Err(Error::InvalidSignature);
         }
         let parameter = public_key.parameter();
-        let x = encode(&self.0[SALT..ELEMENTS], parameter, epoch, message)
+        let x = encode(&self.0[SALT..ELEMENTS], parameter, leaf, message)
             .ok_or(Error::InvalidSignature)?;
-        let ends = Chain::new(parameter, epoch).ends(&x, &self.0[ELEMENTS..PATH]);
-        let mut current = leaf(parameter, epoch, &ends);
+        let ends = Chain::new(parameter, leaf).ends(&x, &self.0[ELEMENTS..PATH]);
+        let mut current = leaf_hash(parameter, leaf, &ends);
         for (level, sibling) in (1..=HEIGHT as u8).zip(self.0[PATH..].chunks_exact(NODE_LENGTH)) {
-            let index = epoch >> level;
-            current = if (epoch >> (level - 1)) & 1 == 0 {
+            let index = leaf >> level;
+            current = if (leaf >> (level - 1)) & 1 == 0 {
                 node(parameter, level, index, &current, sibling)
             } else {
                 node(parameter, level, index, sibling, &current)
@@ -62,8 +55,8 @@ impl Signature {
     }
 }
 
-/// A 256-leaf key. Building it walks every chain of every leaf, ~135k
-/// SHA-256 calls. Not `Clone`, not `Debug`.
+/// Construction 3 Gen with Remark 7's PRF, every node kept (Remark 3):
+/// ~135k hashes to build. Not `Clone`, not `Debug`.
 #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
 pub struct SecretKey {
     seed: [u8; 32],
@@ -80,13 +73,13 @@ impl SecretKey {
     }
 
     pub fn from_seed(seed: [u8; 32]) -> Self {
-        let parameter = crate::seed::parameter(&seed);
+        let parameter = crate::seed::parameter(&seed, HEIGHT as u8);
         let mut nodes = [[0u8; NODE_LENGTH]; 2 * LEAVES as usize - 1];
-        for epoch in 0..LEAVES {
-            nodes[epoch as usize] = leaf(
+        for leaf in 0..LEAVES {
+            nodes[leaf as usize] = leaf_hash(
                 &parameter,
-                epoch,
-                &crate::seed::ends(&seed, &parameter, epoch),
+                leaf,
+                &crate::seed::ends(&seed, &parameter, HEIGHT as u8, leaf),
             );
         }
         for l in 1..=HEIGHT {
@@ -111,22 +104,35 @@ impl SecretKey {
     pub fn public_key(&self) -> PublicKey {
         PublicKey::new(&self.nodes[Self::level(HEIGHT)], &self.parameter)
     }
+}
 
-    /// Sign `message` with leaf `epoch`. The caller owns the rule that an
-    /// epoch is used once; keep the highest epoch ever signed, including in
-    /// transactions that failed. Deterministic in seed, epoch and message.
-    /// `None` if `epoch >= LEAVES` or 2^16 salts all miss the target sum.
-    pub fn sign(&self, epoch: u32, message: &[u8]) -> Option<Signature> {
-        if epoch >= LEAVES {
+#[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
+impl crate::OneTime for SecretKey {
+    type Signature = Signature;
+    const LEAVES: u32 = 1 << HEIGHT;
+    const HEIGHT: u8 = HEIGHT as u8;
+
+    fn from_seed(seed: [u8; 32]) -> Self {
+        SecretKey::from_seed(seed)
+    }
+
+    fn public_key(&self) -> PublicKey {
+        SecretKey::public_key(self)
+    }
+
+    /// Construction 3 Sig plus Construction 1 Path. Records nothing.
+    fn sign_at(&self, leaf: u32, message: &[u8]) -> Option<Signature> {
+        if leaf >= LEAVES {
             return None;
         }
-        let (salt, elements) = crate::seed::sign(&self.seed, &self.parameter, epoch, message)?;
+        let (salt, elements) =
+            crate::seed::sign(&self.seed, &self.parameter, HEIGHT as u8, leaf, message)?;
         let mut sig = Signature([0; SIGNATURE_LENGTH]);
-        sig.0[..SALT].copy_from_slice(&epoch.to_le_bytes());
+        sig.0[..SALT].copy_from_slice(&leaf.to_le_bytes());
         sig.0[SALT..ELEMENTS].copy_from_slice(&salt);
         sig.0[ELEMENTS..PATH].copy_from_slice(&elements);
         for (l, slot) in sig.0[PATH..].chunks_exact_mut(NODE_LENGTH).enumerate() {
-            let sibling = ((epoch as usize) >> l) ^ 1;
+            let sibling = ((leaf as usize) >> l) ^ 1;
             slot.copy_from_slice(&self.nodes[Self::level(l) + sibling]);
         }
         Some(sig)

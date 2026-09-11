@@ -1,16 +1,27 @@
-// Sign a message with a fresh one-time key: `bun examples/sign.ts <seed hex> <message hex>`.
+// Sign a message with a one-time key: `bun examples/sign.ts <key file> <message hex>`.
+// The first run creates the key file from a fresh random seed; later runs open it. The
+// one leaf is spent on the first message: the same message prints the same signature
+// again, any other message is refused.
 
 import { randomBytes } from 'node:crypto';
-import { winternitz } from '@blueshift-gg/solana-winternitz';
+import { existsSync } from 'node:fs';
+import { Signer, winternitz } from '@blueshift-gg/solana-winternitz';
 
-const [seedHex, messageHex = ''] = process.argv.slice(2);
+const [path = 'once.key', messageHex = ''] = process.argv.slice(2);
 const fromHex = (text: string) => Uint8Array.from(text.match(/../g) ?? [], (b) => parseInt(b, 16));
-const seed = seedHex ? fromHex(seedHex) : new Uint8Array(randomBytes(32));
+const toHex = (data: Uint8Array) => Buffer.from(data).toString('hex');
 
-const key = winternitz.SecretKey.fromSeed(seed);
-const publicKey = key.publicKey;
-const signature = key.sign(fromHex(messageHex));
-signature.verify(publicKey, fromHex(messageHex));
-console.log(`seed       ${Buffer.from(seed).toString('hex')}`);
-console.log(`public key ${Buffer.from(publicKey.bytes).toString('hex')}`);
-console.log(`signature  ${Buffer.from(signature.bytes).toString('hex')}`);
+const signer = existsSync(path)
+  ? Signer.open(winternitz.SecretKey, path)
+  : Signer.create(winternitz.SecretKey, path, new Uint8Array(randomBytes(32)));
+try {
+  const message = fromHex(messageHex);
+  const signature = signer.sign(message); // recorded in the key file before it is computed
+  signature.verify(signer.publicKey, message);
+  console.log(`key file   ${path}`);
+  console.log(`public key ${toHex(signer.publicKey.bytes)}`);
+  console.log(`signature  ${toHex(signature.bytes)}`);
+  console.log(`remaining  ${signer.remaining}`);
+} finally {
+  signer.close();
+}

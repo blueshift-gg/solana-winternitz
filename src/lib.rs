@@ -1,26 +1,13 @@
-//! Post-quantum hash-based signatures for Solana programs.
+//! Post-quantum hash-based signatures for Solana programs: DKKW25's
+//! generalized XMSS (Construction 3) over target-sum Winternitz
+//! (Construction 6), with SHA-256 in place of the paper's SHA-3 (§7.2).
+//! [`winternitz`] is the tree of height 0, [`xmss`] the tree of height 8;
+//! one code path serves both. On `target_os = "solana"` every hash is the
+//! `sol_sha256` syscall.
 //!
-//! Generalized XMSS with target-sum Winternitz over a SHA-256 tweakable
-//! hash: Constructions 1, 3 and 6 and §7.2 of Drake, Khovratovich, Kudinov,
-//! Wagner, *Hash-Based Multi-Signatures for Post-Quantum Ethereum* (IACR CiC
-//! 2025, [DKKW25]). Two instances:
-//!
-//! - [`winternitz`]: lifetime 1. One key, one signature.
-//! - [`xmss`]: lifetime 256. One key, 256 signatures indexed by epoch; the
-//!   verifier enforces that no epoch is reused.
-//!
-//! Both use the 56-byte public key `node ‖ P` the paper defines, where `P`
-//! is the per-key public parameter and `node` is the leaf (lifetime 1) or
-//! the Merkle root. Both share the leaf: the salted message digest gives 35
-//! nibbles that must sum to 325, the signer grinds the salt until they do,
-//! and no two such digests are coordinate-wise comparable, which is what a
-//! checksum would otherwise guarantee. Verification is a fixed 200 chain
-//! hashes plus a leaf hash, plus one node hash per tree level.
-//!
-//! Every hash input starts with a role byte, as RFC 8391 §5.1 does, so the
-//! chain, tree, message and key-derivation inputs are disjoint byte strings.
-//!
-//! On `target_os = "solana"` every hash is the `sol_sha256` syscall.
+//! Each departure from the paper is marked where it is made: input order
+//! (§7.1–7.2), HMAC for the message hash (§7.2.1), 24-byte chains under
+//! 32-byte nodes (Theorem 1), seed-derived keys and salts (Remark 7).
 //!
 //! [DKKW25]: https://eprint.iacr.org/2025/055
 #![no_std]
@@ -30,47 +17,54 @@ mod syscalls;
 pub mod winternitz;
 pub mod xmss;
 
+#[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
+extern crate std;
+#[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
+mod signer;
+#[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
+pub use signer::{OneTime, Signer, SignerError};
+
 #[cfg(test)]
 mod tests;
 
-/// Chains `v`, one digest nibble each.
+/// `v`: 35 × 4 bits = 140 ≥ 138, eq. (13).
 const CHAINS: usize = 35;
-/// Chain positions `w`.
+/// `2^w`, w = 4: one nibble per chain, no big-integer decoding.
 const POSITIONS: u8 = 16;
-/// Required nibble sum. Security comes from the 140-bit digest, DKKW25
-/// eq. (13): hitting a signed encoding costs 2^140 hashes however the
-/// target is set. The target only fixes the verifier's work,
-/// `35 × 15 − 325 = 200` chain steps, and the signer's grinding: the layer
-/// of `[16]^35` with this sum holds 2^130.1 vectors, so a uniform digest
-/// lands in it once in ~940 tries.
+/// `T` of Construction 6, above the mean 262.5 as Remark 8 allows (δ =
+/// 1.24 against the paper's 1.1): 35·15 − 325 = 200 verifier steps, ~940
+/// salts per signature by Lemma 7's `η_T`. The digest width carries the
+/// security, not `T`: Lemma 8 reduces to SM-rTCR, eq. (13).
 const TARGET_SUM: u16 = 325;
-/// Salt `ρ`. DKKW25 eq. (14) at lifetime 256 with 2^16 signing trials: ≥ 22 bytes.
+/// `ρ`: eq. (14) at L = 2^8, K = 2^16 needs ≥ 176 bits.
 const SALT_LENGTH: usize = 24;
-/// Public parameter `P`. DKKW25 eq. (16): ≥ 18 bytes.
+/// `P`: eq. (16) needs ≥ 142 bits.
 const PARAMETER_LENGTH: usize = 24;
-/// Chain element `n`. DKKW25 eq. (15) at lifetime 256: ≥ 23 bytes.
+/// `n`: eq. (15) at L = 2^8 needs ≥ 183 bits.
 const ELEMENT_LENGTH: usize = 24;
-/// Leaf and tree node: the full SHA-256 output.
+/// Leaf and node: full SHA-256. Wider than the paper's single `H`; Theorem
+/// 1's tree term then runs against the untruncated hash, see README.
 const NODE_LENGTH: usize = 32;
 const ELEMENTS_LENGTH: usize = CHAINS * ELEMENT_LENGTH;
 
-/// Role byte at offset 0 of every hash input. Within a role every field
-/// but the message has a fixed width and precedes it.
+/// §7.1 domain bytes, eqs. (17)–(19), plus RFC 8391's PRF tag. Placed at
+/// offset 0 rather than after `P` (§7.2.2) so an input's role is its first
+/// byte; every field before the message has a fixed width.
 const ROLE_CHAIN: u8 = 0;
 const ROLE_TREE: u8 = 1;
 const ROLE_MESSAGE: u8 = 2;
 const ROLE_SEED: u8 = 3;
-/// `role ‖ epoch ‖ chain ‖ position`.
+/// `tweak(ep, i, k)` of eq. (17): `role ‖ leaf ‖ chain ‖ position`.
 const CHAIN_TWEAK_LENGTH: usize = 7;
-/// `role ‖ level ‖ index`.
+/// `tweakmt(l, i)` of eq. (18): `role ‖ level ‖ index`.
 const TREE_TWEAK_LENGTH: usize = 6;
 
-/// `node ‖ P`: the leaf for [`winternitz`], the Merkle root for [`xmss`].
+/// `pk = (root, P)` of Construction 3; the root is the leaf at height 0.
 pub const PUBLIC_KEY_LENGTH: usize = NODE_LENGTH + PARAMETER_LENGTH;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The salted digest misses the target sum, the epoch is out of range,
+    /// The salted digest misses the target sum, the leaf is out of range,
     /// or the chains do not close on the public key.
     InvalidSignature,
 }
@@ -97,13 +91,44 @@ impl PublicKey {
     }
 }
 
-/// First 140 bits of `SHA-256(0x02 ‖ epoch ‖ ρ ‖ P ‖ m)` as nibbles, low
-/// nibble first as in hash-sig's `bytes_to_chunks`, accepted only if they
-/// sum to `TARGET_SUM`.
-fn encode(salt: &[u8], parameter: &[u8], epoch: u32, message: &[u8]) -> Option<[u8; CHAINS]> {
-    let mut tweak = [ROLE_MESSAGE, 0, 0, 0, 0];
-    tweak[1..].copy_from_slice(&epoch.to_be_bytes());
-    let digest = sha256::hashv(&[&tweak, salt, parameter, message]);
+/// HMAC-SHA-256 (RFC 2104), keyed by the public message-hash prefix.
+///
+/// Here because §7.2.1's message hash is SHA-3 and a plain SHA-256 in its
+/// place is herdable: once `t` leaves are signed their hash inputs are
+/// public, the `t` first-block states merge at `t · 2^128`, and every
+/// suffix trial then tests `t` encodings, ~2^134 at `t = 64` against the
+/// model's 2^140 (Perlner, Kelsey, Cooper, ePrint 2022/1061). The outer
+/// call re-binds the prefix, so one compression tests one target again.
+/// Keyed hash, not MAC: the key is public.
+fn hmac(key: &[u8], message: &[u8]) -> [u8; sha256::HASH_LENGTH] {
+    // Eight-byte XORs: a byte loop measured ~1,000 CU on SBPF.
+    let mut padded = [0u8; 64];
+    padded[..key.len()].copy_from_slice(key);
+    let mut ipad = [0u8; 64];
+    let mut opad = [0u8; 64];
+    for ((k, i), o) in padded
+        .chunks_exact(8)
+        .zip(ipad.chunks_exact_mut(8))
+        .zip(opad.chunks_exact_mut(8))
+    {
+        let k = u64::from_ne_bytes(k.try_into().unwrap());
+        i.copy_from_slice(&(k ^ 0x3636_3636_3636_3636).to_ne_bytes());
+        o.copy_from_slice(&(k ^ 0x5c5c_5c5c_5c5c_5c5c).to_ne_bytes());
+    }
+    let inner = sha256::hashv(&[&ipad, message]);
+    sha256::hashv(&[&opad, &inner])
+}
+
+/// Construction 6: `Th_msg` as `v` chunks of `w` bits, accepted iff they
+/// sum to `T`. Chunks are low nibble first, hash-sig's `bytes_to_chunks`.
+/// The raw message goes in: Remark 1's compression step is the HMAC itself.
+fn encode(salt: &[u8], parameter: &[u8], leaf: u32, message: &[u8]) -> Option<[u8; CHAINS]> {
+    let mut key = [0u8; 5 + SALT_LENGTH + PARAMETER_LENGTH];
+    key[0] = ROLE_MESSAGE;
+    key[1..5].copy_from_slice(&leaf.to_be_bytes());
+    key[5..5 + SALT_LENGTH].copy_from_slice(salt);
+    key[5 + SALT_LENGTH..].copy_from_slice(parameter);
+    let digest = hmac(&key, message);
     let mut x = [0u8; CHAINS];
     for (i, xi) in x.iter_mut().enumerate() {
         *xi = digest[i / 2] >> (4 * (i % 2)) & 0x0f;
@@ -111,8 +136,8 @@ fn encode(salt: &[u8], parameter: &[u8], epoch: u32, message: &[u8]) -> Option<[
     (x.iter().map(|&v| u16::from(v)).sum::<u16>() == TARGET_SUM).then_some(x)
 }
 
-/// Chain-step input `0x00 ‖ epoch ‖ i ‖ k ‖ P ‖ x`: one 55-byte slice per
-/// syscall, reused across every step of every chain of one epoch.
+/// Construction 2's chain, `Th(P, tweak(ep, i, k), x)` laid out as one
+/// 55-byte buffer: each step is one syscall over one SHA-256 block.
 struct Chain([u8; Chain::VALUE + ELEMENT_LENGTH]);
 
 impl Chain {
@@ -120,16 +145,17 @@ impl Chain {
     const POSITION: usize = 6;
     const VALUE: usize = CHAIN_TWEAK_LENGTH + PARAMETER_LENGTH;
 
-    fn new(parameter: &[u8], epoch: u32) -> Self {
+    fn new(parameter: &[u8], leaf: u32) -> Self {
         let mut buf = [0u8; Self::VALUE + ELEMENT_LENGTH];
         buf[0] = ROLE_CHAIN;
-        buf[1..Self::INDEX].copy_from_slice(&epoch.to_be_bytes());
+        buf[1..Self::INDEX].copy_from_slice(&leaf.to_be_bytes());
         buf[CHAIN_TWEAK_LENGTH..Self::VALUE].copy_from_slice(parameter);
         Self(buf)
     }
 
-    /// Walk chain `i` from position `from` to `to`, starting at `x`. The step
-    /// into position `k` is tweaked with `k`, as in hash-sig's `chain`.
+    /// Construction 2: the step into position `k` carries tweak `k`, as
+    /// hash-sig's `chain`. Lemma 2 is why signer and verifier may split
+    /// the walk at `x_i`.
     fn walk(&mut self, i: u8, from: u8, to: u8, x: &[u8; ELEMENT_LENGTH]) -> [u8; ELEMENT_LENGTH] {
         self.0[Self::INDEX] = i;
         self.0[Self::VALUE..].copy_from_slice(x);
@@ -141,7 +167,7 @@ impl Chain {
         self.0[Self::VALUE..].try_into().unwrap()
     }
 
-    /// Walk every chain of `elements` from the encoded positions to the end.
+    /// Construction 3 Ver step 6: each `σ_i` walked from `x_i` to `2^w − 1`.
     fn ends(&mut self, x: &[u8; CHAINS], elements: &[u8]) -> [[u8; ELEMENT_LENGTH]; CHAINS] {
         let mut ends = [[0u8; ELEMENT_LENGTH]; CHAINS];
         for (i, (end, element)) in ends
@@ -155,18 +181,23 @@ impl Chain {
     }
 }
 
+/// `tweakmt(l, i)`, eq. (18).
 fn tree_tweak(level: u8, index: u32) -> [u8; TREE_TWEAK_LENGTH] {
     let mut tweak = [ROLE_TREE, level, 0, 0, 0, 0];
     tweak[2..].copy_from_slice(&index.to_be_bytes());
     tweak
 }
 
-/// `SHA-256(0x01 ‖ 0 ‖ epoch ‖ P ‖ pk_0 ‖ … ‖ pk_34)`: the leaf of DKKW25
-/// Construction 3, and the whole tree at lifetime 1.
-fn leaf(parameter: &[u8], epoch: u32, ends: &[[u8; ELEMENT_LENGTH]; CHAINS]) -> [u8; NODE_LENGTH] {
+/// Construction 1 leaf, `Th(P, tweakmt(0, i), pk_i)`, `pk_i` the 35 chain
+/// ends of Construction 3.
+fn leaf_hash(
+    parameter: &[u8],
+    leaf: u32,
+    ends: &[[u8; ELEMENT_LENGTH]; CHAINS],
+) -> [u8; NODE_LENGTH] {
     const ENDS: usize = TREE_TWEAK_LENGTH + PARAMETER_LENGTH;
     let mut buf = [0u8; ENDS + ELEMENTS_LENGTH];
-    buf[..TREE_TWEAK_LENGTH].copy_from_slice(&tree_tweak(0, epoch));
+    buf[..TREE_TWEAK_LENGTH].copy_from_slice(&tree_tweak(0, leaf));
     buf[TREE_TWEAK_LENGTH..ENDS].copy_from_slice(parameter);
     for (slot, end) in buf[ENDS..].chunks_exact_mut(ELEMENT_LENGTH).zip(ends) {
         slot.copy_from_slice(end);
@@ -174,79 +205,96 @@ fn leaf(parameter: &[u8], epoch: u32, ends: &[[u8; ELEMENT_LENGTH]; CHAINS]) -> 
     sha256::hashv(&[&buf])
 }
 
-/// `SHA-256(0x01 ‖ level ‖ index ‖ P ‖ left ‖ right)`: DKKW25 Construction 1.
+/// Construction 1 node, `Th(P, tweakmt(l, i), (left, right))`.
 fn node(parameter: &[u8], level: u8, index: u32, left: &[u8], right: &[u8]) -> [u8; NODE_LENGTH] {
     sha256::hashv(&[&tree_tweak(level, index), parameter, left, right])
 }
 
-/// Host-only key material, everything derived from a 32-byte seed by
-/// `SHA-256(0x03 ‖ purpose ‖ fields ‖ seed)`, assumed to be a PRF keyed by
-/// the seed (DKKW25 Remark 7; RFC 8391 §5.1 uses the same construction).
+/// Key material from one 32-byte seed, Remark 7's PRF, as
+/// `SHA-256(0x03 ‖ purpose ‖ height ‖ fields ‖ seed)[..]`. Salts come from
+/// it too, which the paper samples fresh: distinct (purpose, height, leaf,
+/// counter) labels make them independent under the PRF, and one message
+/// per leaf keeps the labels distinct. `height` is here because without it
+/// the `winternitz` leaf is `xmss` leaf 0 of the same seed.
 #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
 mod seed {
     use super::*;
 
-    /// Salts tried before giving up: expected ~940, so under a uniform model
-    /// all miss with probability e^-70. Two hashes per try. DKKW25 eq. (14)
-    /// sizes the salt for this.
+    /// `K` of Construction 3, error `δ^K` by Lemma 3: ~940 expected, all
+    /// miss once in e^70. Eq. (14) prices the salt for this `K`.
     pub const MAX_TRIALS: u32 = 1 << 16;
 
     const PARAMETER: u8 = 0;
     const START: u8 = 1;
     const SALT: u8 = 2;
 
-    pub fn parameter(seed: &[u8; 32]) -> [u8; PARAMETER_LENGTH] {
-        sha256::hashv(&[&[ROLE_SEED, PARAMETER], seed])[..PARAMETER_LENGTH]
+    pub fn parameter(seed: &[u8; 32], height: u8) -> [u8; PARAMETER_LENGTH] {
+        sha256::hashv(&[&[ROLE_SEED, PARAMETER, height], seed])[..PARAMETER_LENGTH]
             .try_into()
             .unwrap()
     }
 
-    fn start(seed: &[u8; 32], epoch: u32, i: u8) -> [u8; ELEMENT_LENGTH] {
-        sha256::hashv(&[&[ROLE_SEED, START], &epoch.to_be_bytes(), &[i], seed])[..ELEMENT_LENGTH]
+    fn start(seed: &[u8; 32], height: u8, leaf: u32, i: u8) -> [u8; ELEMENT_LENGTH] {
+        sha256::hashv(&[&[ROLE_SEED, START, height], &leaf.to_be_bytes(), &[i], seed])
+            [..ELEMENT_LENGTH]
             .try_into()
             .unwrap()
     }
 
-    /// Chain ends of one epoch: its leaf content.
-    pub fn ends(seed: &[u8; 32], parameter: &[u8], epoch: u32) -> [[u8; ELEMENT_LENGTH]; CHAINS] {
-        let mut chain = Chain::new(parameter, epoch);
+    /// Construction 3 Gen step 2: the chain ends `pk_ep`.
+    pub fn ends(
+        seed: &[u8; 32],
+        parameter: &[u8],
+        height: u8,
+        leaf: u32,
+    ) -> [[u8; ELEMENT_LENGTH]; CHAINS] {
+        let mut chain = Chain::new(parameter, leaf);
         let mut ends = [[0u8; ELEMENT_LENGTH]; CHAINS];
         for (i, end) in ends.iter_mut().enumerate() {
-            *end = chain.walk(i as u8, 0, POSITIONS - 1, &start(seed, epoch, i as u8));
+            *end = chain.walk(
+                i as u8,
+                0,
+                POSITIONS - 1,
+                &start(seed, height, leaf, i as u8),
+            );
         }
         ends
     }
 
-    /// Deterministic one-time signature of `message` under `epoch`: the salt
-    /// and the 35 chain elements. Salt candidates are
-    /// `SHA-256(0x03 ‖ 2 ‖ epoch ‖ ctr ‖ SHA-256(m) ‖ seed)`; `None` only if
-    /// all `MAX_TRIALS` miss the target sum.
+    /// Construction 3 Sig steps 3–5 with salt candidates from the PRF over
+    /// `(leaf, ctr, SHA-256(m))`; `None` iff all `MAX_TRIALS` miss.
     pub fn sign(
         seed: &[u8; 32],
         parameter: &[u8],
-        epoch: u32,
+        height: u8,
+        leaf: u32,
         message: &[u8],
     ) -> Option<([u8; SALT_LENGTH], [u8; ELEMENTS_LENGTH])> {
         let digest = sha256::hashv(&[message]);
-        let mut chain = Chain::new(parameter, epoch);
+        let mut chain = Chain::new(parameter, leaf);
         (0..MAX_TRIALS).find_map(|ctr| {
             let salt: [u8; SALT_LENGTH] = sha256::hashv(&[
-                &[ROLE_SEED, SALT],
-                &epoch.to_be_bytes(),
+                &[ROLE_SEED, SALT, height],
+                &leaf.to_be_bytes(),
                 &ctr.to_be_bytes(),
                 &digest,
                 seed,
             ])[..SALT_LENGTH]
                 .try_into()
                 .unwrap();
-            let x = encode(&salt, parameter, epoch, message)?;
+            let x = encode(&salt, parameter, leaf, message)?;
             let mut elements = [0u8; ELEMENTS_LENGTH];
             for (i, (slot, &xi)) in elements
                 .chunks_exact_mut(ELEMENT_LENGTH)
                 .zip(&x)
                 .enumerate()
             {
-                slot.copy_from_slice(&chain.walk(i as u8, 0, xi, &start(seed, epoch, i as u8)));
+                slot.copy_from_slice(&chain.walk(
+                    i as u8,
+                    0,
+                    xi,
+                    &start(seed, height, leaf, i as u8),
+                ));
             }
             Some((salt, elements))
         })

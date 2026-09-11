@@ -1,0 +1,276 @@
+//! Host-side signer owning leaf allocation, after winterwallet's client.
+//! Here because Theorem 1 admits one signature per leaf and neither the
+//! seed nor the chain records which leaves are spent: the record is
+//! written before a signature exists, one instance holds a file, and a
+//! file opens only from itself.
+
+use std::fs::{self, File, TryLockError};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+
+use crate::{PublicKey, sha256};
+
+/// The two instances as the signer sees them. `sign_at` is Construction 3's
+/// Sig with no one-use rule; [`Signer`] supplies the rule.
+pub trait OneTime: Sized {
+    type Signature;
+    const LEAVES: u32;
+    /// In the key file, so a file opens only under its own instance.
+    const HEIGHT: u8;
+    fn from_seed(seed: [u8; 32]) -> Self;
+    fn public_key(&self) -> PublicKey;
+    fn sign_at(&self, leaf: u32, message: &[u8]) -> Option<Self::Signature>;
+}
+
+/// Every variant fails closed: no signature is released.
+#[derive(Debug)]
+pub enum SignerError {
+    /// `create` on an existing key file.
+    Exists,
+    /// `open` with no key file: a seed cannot say which leaves are spent.
+    Missing,
+    /// Another signer holds the file.
+    Locked,
+    /// Wrong length, version or instance height.
+    Corrupt,
+    /// The record is behind the chain: a restored old copy.
+    BelowFloor {
+        next_leaf: u32,
+        floor: u32,
+    },
+    Exhausted,
+    /// All `K` salts missed; the leaf is spent anyway.
+    SaltsExhausted,
+    Io(io::Error),
+}
+
+impl From<io::Error> for SignerError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl core::fmt::Display for SignerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Exists => f.write_str("a key file already exists at this path: open it instead"),
+            Self::Missing => f.write_str(
+                "no key file at this path: a seed alone cannot say which leaves are spent",
+            ),
+            Self::Locked => f.write_str("the key file is held by another signer"),
+            Self::Corrupt => f.write_str("the key file is not a record of this instance"),
+            Self::BelowFloor { next_leaf, floor } => write!(
+                f,
+                "the key file is behind the chain: next leaf {next_leaf}, floor {floor}"
+            ),
+            Self::Exhausted => f.write_str("every leaf is spent"),
+            Self::SaltsExhausted => {
+                f.write_str("2^16 salts missed the target sum; the leaf is spent")
+            }
+            Self::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for SignerError {}
+
+// Key file: version ‖ height ‖ seed ‖ next leaf LE ‖ digest flag ‖ digest,
+// 71 bytes, byte-identical to the TypeScript package's.
+const VERSION: u8 = 1;
+const SEED: usize = 2;
+const NEXT_LEAF: usize = SEED + 32;
+const HAS_DIGEST: usize = NEXT_LEAF + 4;
+const DIGEST: usize = HAS_DIGEST + 1;
+const RECORD: usize = DIGEST + 32;
+
+/// `create` from a fresh seed, `open` from the file, `sign` a message: a
+/// new message spends the next leaf after the record is on disk, the last
+/// message again returns the same bytes and spends nothing.
+pub struct Signer<K: OneTime> {
+    key: K,
+    seed: [u8; 32],
+    path: PathBuf,
+    _lock: File,
+    next_leaf: u32,
+    last_digest: Option<[u8; 32]>,
+}
+
+impl<K: OneTime> Signer<K> {
+    /// The seed must never have signed; the file is what to back up.
+    pub fn create(path: impl AsRef<Path>, seed: [u8; 32]) -> Result<Self, SignerError> {
+        let path = path.as_ref().to_path_buf();
+        let lock = lock(&path)?;
+        let mut file = options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::AlreadyExists => SignerError::Exists,
+                _ => SignerError::Io(error),
+            })?;
+        let signer = Self {
+            key: K::from_seed(seed),
+            seed,
+            path,
+            _lock: lock,
+            next_leaf: 0,
+            last_digest: None,
+        };
+        file.write_all(&signer.record())?;
+        file.sync_all()?;
+        sync_dir(&signer.path)?;
+        Ok(signer)
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, SignerError> {
+        let path = path.as_ref().to_path_buf();
+        let lock = lock(&path)?;
+        let mut bytes = std::vec::Vec::new();
+        File::open(&path)
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => SignerError::Missing,
+                _ => SignerError::Io(error),
+            })?
+            .read_to_end(&mut bytes)?;
+        let record: &[u8; RECORD] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| SignerError::Corrupt)?;
+        let next_leaf = u32::from_le_bytes(record[NEXT_LEAF..HAS_DIGEST].try_into().unwrap());
+        if record[0] != VERSION
+            || record[1] != K::HEIGHT
+            || record[HAS_DIGEST] > 1
+            || next_leaf > K::LEAVES
+        {
+            return Err(SignerError::Corrupt);
+        }
+        let seed: [u8; 32] = record[SEED..NEXT_LEAF].try_into().unwrap();
+        Ok(Self {
+            key: K::from_seed(seed),
+            seed,
+            path,
+            _lock: lock,
+            next_leaf,
+            last_digest: (record[HAS_DIGEST] == 1).then(|| record[DIGEST..].try_into().unwrap()),
+        })
+    }
+
+    /// `floor` is the chain's last accepted leaf plus one. Catches a restored
+    /// old copy, not leaves exposed by transactions that never landed.
+    pub fn floor(self, floor: u32) -> Result<Self, SignerError> {
+        if self.next_leaf < floor {
+            return Err(SignerError::BelowFloor {
+                next_leaf: self.next_leaf,
+                floor,
+            });
+        }
+        Ok(self)
+    }
+
+    pub fn public_key(&self) -> PublicKey {
+        self.key.public_key()
+    }
+
+    pub fn next_leaf(&self) -> u32 {
+        self.next_leaf
+    }
+
+    pub fn remaining(&self) -> u32 {
+        K::LEAVES - self.next_leaf
+    }
+
+    /// Record first, sign second (RFC 8391 §4.1.9); the last message is
+    /// repeated, never re-spent.
+    pub fn sign(&mut self, message: &[u8]) -> Result<K::Signature, SignerError> {
+        let digest = sha256::hashv(&[message]);
+        if self.last_digest == Some(digest)
+            && let Some(signature) = self.key.sign_at(self.next_leaf - 1, message)
+        {
+            return Ok(signature);
+        }
+        if self.next_leaf >= K::LEAVES {
+            return Err(SignerError::Exhausted);
+        }
+        let leaf = self.next_leaf;
+        self.next_leaf = leaf + 1;
+        self.last_digest = Some(digest);
+        if let Err(error) = self.write() {
+            // On disk or not, the leaf stays spent; the digest goes so the
+            // unrecorded signature can never be handed out.
+            self.last_digest = None;
+            return Err(error);
+        }
+        self.key
+            .sign_at(leaf, message)
+            .ok_or(SignerError::SaltsExhausted)
+    }
+
+    fn record(&self) -> [u8; RECORD] {
+        let mut record = [0u8; RECORD];
+        record[0] = VERSION;
+        record[1] = K::HEIGHT;
+        record[SEED..NEXT_LEAF].copy_from_slice(&self.seed);
+        record[NEXT_LEAF..HAS_DIGEST].copy_from_slice(&self.next_leaf.to_le_bytes());
+        if let Some(digest) = &self.last_digest {
+            record[HAS_DIGEST] = 1;
+            record[DIGEST..].copy_from_slice(digest);
+        }
+        record
+    }
+
+    fn write(&self) -> Result<(), SignerError> {
+        let tmp = sibling(&self.path, ".tmp");
+        let mut file = options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(&self.record())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &self.path)?;
+        sync_dir(&self.path)
+    }
+}
+
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn options() -> fs::OpenOptions {
+    let mut options = File::options();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+/// A sidecar, because rename would orphan a lock on the record itself.
+/// Released on drop or process death.
+fn lock(path: &Path) -> Result<File, SignerError> {
+    let file = options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(sibling(path, ".lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(SignerError::Locked),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+/// A rename is durable only once its directory is synced.
+fn sync_dir(path: &Path) -> Result<(), SignerError> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        File::open(parent.unwrap_or(Path::new(".")))?.sync_all()?;
+    }
+    Ok(())
+}
