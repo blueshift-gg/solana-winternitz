@@ -33,6 +33,6 @@ signed again returns the same bytes without spending one. `signAt(leaf,
 message)` on either key is the primitive underneath and records nothing.
 Byte getters return copies.
 
-See the [repository README](https://github.com/blueshift-gg/solana-winternitz)
-for the scheme, the on-chain verifier, the security model, and the
-verification evidence.
+The repository's [SPEC.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SPEC.md)
+defines every byte and [SECURITY.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SECURITY.md)
+the claim and its assumptions.

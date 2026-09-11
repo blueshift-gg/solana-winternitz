@@ -1,6 +1,6 @@
 //! Construction 3 at L = 2^8, public key `(root, P)`. The verifier cannot
-//! see history: the program enforces a leaf policy on the index (README)
-//! and [`crate::Signer`] enforces one message per leaf.
+//! see history: the program enforces a leaf policy on the index
+//! (SECURITY.md) and [`crate::Signer`] enforces one message per leaf.
 
 use crate::{
     Chain, ELEMENTS_LENGTH, Error, NODE_LENGTH, PARAMETER_LENGTH, PublicKey, SALT_LENGTH, encode,

@@ -43,7 +43,7 @@ const PARAMETER_LENGTH: usize = 24;
 /// `n`: eq. (15) at L = 2^8 needs ≥ 183 bits.
 const ELEMENT_LENGTH: usize = 24;
 /// Leaf and node: full SHA-256. Wider than the paper's single `H`; Theorem
-/// 1's tree term then runs against the untruncated hash, see README.
+/// 1's tree term then runs against the untruncated hash, see SECURITY.md.
 const NODE_LENGTH: usize = 32;
 const ELEMENTS_LENGTH: usize = CHAINS * ELEMENT_LENGTH;
 

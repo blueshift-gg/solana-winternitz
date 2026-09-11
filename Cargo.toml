@@ -8,7 +8,7 @@ edition = "2024"
 repository = "https://github.com/blueshift-gg/solana-winternitz"
 keywords = ["solana", "winternitz", "post-quantum", "hash-based", "no-std"]
 categories = ["cryptography", "no-std"]
-include = ["/src", "/tests", "/LICENSE", "/README.md"]
+include = ["/src", "/tests", "/LICENSE", "/README.md", "/SPEC.md", "/SECURITY.md"]
 
 [features]
 default = []
