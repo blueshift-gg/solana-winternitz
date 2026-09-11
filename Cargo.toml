@@ -1,0 +1,37 @@
+[package]
+name = "solana-winternitz"
+authors = ["L0STE"]
+description = "Post-quantum one-time signatures for Solana programs: target-sum Winternitz over tweakable SHA-256, verified with the sol_sha256 syscall"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/blueshift-gg/solana-winternitz"
+readme = "README.md"
+keywords = ["solana", "winternitz", "post-quantum", "hash-based", "no-std"]
+categories = ["cryptography", "no-std"]
+include = ["/src", "/tests", "/LICENSE", "/README.md"]
+
+[features]
+default = []
+# Host-only key generation and signing (never compiled for `target_os =
+# "solana"`: signing on-chain reveals the secret key).
+sign = []
+# Use the SBPF v3 static-syscall ABI (murmur3-hashed name → fn pointer) even
+# on toolchains that support it but do not advertise `target_feature =
+# "static-syscalls"`.
+static-syscalls = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(target_os, values("solana"))',
+    'cfg(target_feature, values("static-syscalls"))',
+] }
+
+# Host SHA-256. Never compiled for the Solana target, where it is a syscall.
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+sha2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+num-bigint = "0.4"
+serde_json = "1"
+svm-unit-test = "0.1.10"

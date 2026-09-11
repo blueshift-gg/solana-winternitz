@@ -1,0 +1,6 @@
+{
+  "name": "examples",
+  "private": true,
+  "type": "module",
+  "dependencies": { "@blueshift-gg/solana-winternitz": "workspace:*" }
+}

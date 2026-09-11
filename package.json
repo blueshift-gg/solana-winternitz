@@ -1,0 +1,14 @@
+{
+  "name": "solana-winternitz-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*", "examples"],
+  "scripts": {
+    "build": "tsc -b packages/winternitz",
+    "test": "bun run build && tsc -p tsconfig.test.json && bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.9.0"
+  }
+}
