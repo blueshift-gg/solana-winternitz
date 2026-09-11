@@ -1,7 +1,7 @@
 # Solana Winternitz
 
 [![CI](https://github.com/blueshift-gg/solana-winternitz/actions/workflows/ci.yml/badge.svg)](https://github.com/blueshift-gg/solana-winternitz/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/blueshift-gg/solana-winternitz/blob/main/LICENSE)
 
 Post-quantum hash-based signatures for Solana programs, verified with the
 `sol_sha256` syscall alone. Generalized XMSS over target-sum Winternitz,
@@ -20,9 +20,9 @@ code, not audited.
 code path serves both. Verification is constant work: the message hash,
 200 chain steps, one leaf hash, one node hash per tree level.
 
-- [SPEC.md](SPEC.md): every byte from seed to signature, the key file, the
+- [SPEC.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SPEC.md): every byte from seed to signature, the key file, the
   vectors, and where this departs from the paper.
-- [SECURITY.md](SECURITY.md): the claim, the assumptions behind it, the
+- [SECURITY.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SECURITY.md): the claim, the assumptions behind it, the
   arguments and measurements that support them, and what is not proven.
 
 ## Verify on-chain
@@ -32,7 +32,7 @@ code path serves both. Verification is constant work: the message hash,
 solana-winternitz = "0.1"
 ```
 
-```rust
+```rust,ignore
 use solana_winternitz::{PublicKey, winternitz, xmss};
 
 winternitz::Signature(signature_bytes).verify(&PublicKey(stored), message)?;
@@ -108,8 +108,8 @@ for these inputs, and the tests pin them.
 
 `cargo test --lib` pins the four parameter bounds, the HMAC against RFC
 4231, the syscall ids, both instances against
-[`tests/vectors.json`](tests/vectors.json) and the key file
-[`tests/winternitz.key`](tests/winternitz.key), rejection of every
+[`tests/vectors.json`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/vectors.json) and the key file
+[`tests/winternitz.key`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/winternitz.key), rejection of every
 single-byte tamper, seed separation between the instances, and the
 signer's rules. The TypeScript package is a second implementation written
 from `SPEC.md`, sharing no code, that must reproduce every vector.

@@ -110,10 +110,12 @@ message signed, flag 0 before the first signature.
 
 ## Vectors
 
-`tests/vectors.json` holds three `winternitz` and three `xmss` cases with
-`seed`, `message`, `public_key`, `signature` and, for `xmss`, `leaf` as a
-number. `tests/winternitz.key` is the key file of `winternitz` case 1
-after signing its message. `cargo test --lib regenerate_vectors --
+`tests/vectors.json` holds ten cases per instance with `seed`, `message`,
+`public_key`, `signature` and, for `xmss`, `leaf` as a number: three
+named cases, then messages of 11, 12, 55, 56, 63, 64 and 65 bytes, the
+edges of the message hash's first block, padding and block boundary,
+signed under one `xmss` key at leaves 2 to 8. `tests/winternitz.key` is
+the key file of `winternitz` case 1 after signing its message. `cargo test --lib regenerate_vectors --
 --ignored` rewrites both; `tests/sbpf.rs` embeds case 1 of each corpus as
 byte arrays that must be regenerated with them.
 

@@ -202,6 +202,40 @@ fn tampering_is_rejected() {
     }
 }
 
+/// Random bytes as signatures, keys and messages, and every out-of-range
+/// leaf: rejected, never a panic.
+#[test]
+fn garbage_is_rejected_without_panic() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut fill = |bytes: &mut [u8]| {
+        for b in bytes {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = state as u8;
+        }
+    };
+    let mut pk = PublicKey([0; PUBLIC_KEY_LENGTH]);
+    let mut once = winternitz::Signature([0; winternitz::SIGNATURE_LENGTH]);
+    let mut tree = xmss::Signature([0; xmss::SIGNATURE_LENGTH]);
+    let mut message = [0u8; 64];
+    for i in 0..2000u32 {
+        fill(&mut pk.0);
+        fill(&mut once.0);
+        fill(&mut tree.0);
+        fill(&mut message);
+        if i % 4 == 0 {
+            tree.0[..4].copy_from_slice(&(i % 3 * 128).to_le_bytes());
+        }
+        assert_eq!(once.verify(&pk, &message), Err(Error::InvalidSignature));
+        assert_eq!(tree.verify(&pk, &message), Err(Error::InvalidSignature));
+    }
+    for leaf in [xmss::LEAVES, xmss::LEAVES + 1, u32::MAX] {
+        tree.0[..4].copy_from_slice(&leaf.to_le_bytes());
+        assert_eq!(tree.verify(&pk, &message), Err(Error::InvalidSignature));
+    }
+}
+
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(std::format!(
         "solana-winternitz-{name}-{}",
@@ -334,8 +368,16 @@ fn vectors_are_reproduced() {
     );
     drop(once);
     std::fs::remove_dir_all(&dir).unwrap();
+    let mut keys: Vec<(Vec<u8>, xmss::SecretKey)> = Vec::new();
     for v in tree {
-        let sk = xmss::SecretKey::from_seed(field(v, "seed").try_into().unwrap());
+        let seed = field(v, "seed");
+        if keys.iter().all(|(s, _)| *s != seed) {
+            keys.push((
+                seed.clone(),
+                xmss::SecretKey::from_seed(seed.as_slice().try_into().unwrap()),
+            ));
+        }
+        let sk = &keys.iter().find(|(s, _)| *s == seed).unwrap().1;
         let leaf = v["leaf"].as_u64().unwrap() as u32;
         let pk = PublicKey(field(v, "public_key").try_into().unwrap());
         let signature = xmss::Signature(field(v, "signature").try_into().unwrap());
@@ -350,47 +392,67 @@ fn vectors_are_reproduced() {
 #[test]
 #[ignore]
 fn regenerate_vectors() {
-    let cases: [(&[u8], &[u8]); 3] = [
-        (b"", b""),
-        (b"blueshift", b"rotate to 11111111111111111111111111111111"),
-        (&[0x42; 32], &[0u8; 100]),
+    // Three named cases, then messages at the message hash's block edges:
+    // 11 and 12 bytes finish or overflow the first block after the 53-byte
+    // prefix, 55 and 56 sit on the padding edge, 63 to 65 on the block.
+    let named_seed = |prefix: &[u8], i: u8| {
+        let mut s = [0u8; 32];
+        s[..prefix.len()].copy_from_slice(prefix);
+        s[31] = i;
+        s
+    };
+    let mut cases: Vec<([u8; 32], u32, Vec<u8>)> = std::vec![
+        (named_seed(b"", 0), 0, Vec::new()),
+        (
+            named_seed(b"blueshift", 1),
+            1,
+            b"rotate to 11111111111111111111111111111111".to_vec(),
+        ),
+        (
+            named_seed(&[0x42; 32], 2),
+            xmss::LEAVES - 1,
+            std::vec![0u8; 100]
+        ),
     ];
-    let seeds: Vec<[u8; 32]> = cases
+    for (j, n) in [11usize, 12, 55, 56, 63, 64, 65].into_iter().enumerate() {
+        cases.push((
+            [n as u8; 32],
+            2 + j as u32,
+            (0..n).map(|i| i as u8).collect(),
+        ));
+    }
+    let ots: Vec<Value> = cases
         .iter()
-        .enumerate()
-        .map(|(i, (prefix, _))| {
-            let mut seed = [0u8; 32];
-            seed[..prefix.len()].copy_from_slice(prefix);
-            seed[31] = i as u8;
-            seed
-        })
-        .collect();
-    let ots: Vec<Value> = seeds
-        .iter()
-        .zip(&cases)
-        .map(|(seed, (_, message))| {
+        .map(|(seed, _, message)| {
             let sk = winternitz::SecretKey(*seed);
-            let public_key = sk.public_key();
             serde_json::json!({
                 "seed": to_hex(seed),
                 "message": to_hex(message),
-                "public_key": to_hex(&public_key.0),
+                "public_key": to_hex(&sk.public_key().0),
                 "signature": to_hex(&sk.sign_at(0, message).unwrap().0),
             })
         })
         .collect();
-    let tree: Vec<Value> = seeds
+    // One xmss key for every boundary case: the corpus pins leaves, not keys.
+    let boundary = xmss::SecretKey::from_seed(seed(3));
+    let tree: Vec<Value> = cases
         .iter()
-        .zip(&cases)
-        .zip([0u32, 1, xmss::LEAVES - 1])
-        .map(|((seed, (_, message)), leaf)| {
-            let sk = xmss::SecretKey::from_seed(*seed);
+        .enumerate()
+        .map(|(i, (seed, leaf, message))| {
+            let named;
+            let sk = if i < 3 {
+                named = xmss::SecretKey::from_seed(*seed);
+                &named
+            } else {
+                &boundary
+            };
+            let seed = if i < 3 { *seed } else { self::seed(3) };
             serde_json::json!({
-                "seed": to_hex(seed),
+                "seed": to_hex(&seed),
                 "leaf": leaf,
                 "message": to_hex(message),
                 "public_key": to_hex(&sk.public_key().0),
-                "signature": to_hex(&sk.sign_at(leaf, message).unwrap().0),
+                "signature": to_hex(&sk.sign_at(*leaf, message).unwrap().0),
             })
         })
         .collect();
@@ -403,8 +465,8 @@ fn regenerate_vectors() {
     .unwrap();
     let dir = temp_dir("regenerate");
     let path = dir.join("once.key");
-    let mut once = crate::Signer::<winternitz::SecretKey>::create(&path, seeds[1]).unwrap();
-    once.sign(cases[1].1).unwrap();
+    let mut once = crate::Signer::<winternitz::SecretKey>::create(&path, cases[1].0).unwrap();
+    once.sign(&cases[1].2).unwrap();
     drop(once);
     std::fs::copy(
         &path,

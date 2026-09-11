@@ -9,6 +9,10 @@ pub const HASH_LENGTH: usize = 32;
 #[inline(always)]
 pub fn hashv(data: &[&[u8]]) -> [u8; HASH_LENGTH] {
     let mut out = core::mem::MaybeUninit::<[u8; HASH_LENGTH]>::uninit();
+    // SAFETY: the syscall reads `data.len()` (pointer, length) pairs from
+    // `data`, which is how `&[&[u8]]` is laid out on this target and what
+    // `solana_program::hash::hashv` passes, and writes exactly `HASH_LENGTH`
+    // bytes to `out` before returning, so `out` is initialized.
     unsafe {
         crate::syscalls::sol_sha256(
             data as *const _ as *const u8,

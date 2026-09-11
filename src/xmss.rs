@@ -7,7 +7,9 @@ use crate::{
     leaf_hash, node,
 };
 
+/// Tree height `h`.
 pub const HEIGHT: usize = 8;
+/// Leaves, and so signatures, per key.
 pub const LEAVES: u32 = 1 << HEIGHT;
 /// `(ep, ρ, σ_OTS, path_ep)` of Construction 3, `ep` as u32 LE.
 pub const SIGNATURE_LENGTH: usize = 4 + SALT_LENGTH + ELEMENTS_LENGTH + HEIGHT * NODE_LENGTH;
@@ -16,6 +18,7 @@ const SALT: usize = 4;
 const ELEMENTS: usize = SALT + SALT_LENGTH;
 const PATH: usize = ELEMENTS + ELEMENTS_LENGTH;
 
+/// A signature under one leaf, 1,124 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Signature(pub [u8; SIGNATURE_LENGTH]);
 
@@ -67,12 +70,20 @@ pub struct SecretKey {
 }
 
 #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        crate::wipe(&mut self.seed);
+    }
+}
+
+#[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
 impl SecretKey {
     /// Where level `l` starts in `nodes`.
     const fn level(l: usize) -> usize {
         2 * LEAVES as usize - (2 << (HEIGHT - l))
     }
 
+    /// Construction 3 Gen: every chain of every leaf, then the tree.
     pub fn from_seed(seed: [u8; 32]) -> Self {
         let parameter = crate::seed::parameter(&seed, HEIGHT as u8);
         let mut nodes = [[0u8; NODE_LENGTH]; 2 * LEAVES as usize - 1];
@@ -102,6 +113,7 @@ impl SecretKey {
         }
     }
 
+    /// `root ‖ P`.
     pub fn public_key(&self) -> PublicKey {
         PublicKey::new(&self.nodes[Self::level(HEIGHT)], &self.parameter)
     }

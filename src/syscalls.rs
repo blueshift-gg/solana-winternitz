@@ -21,6 +21,10 @@ unsafe extern "C" {
 #[inline(always)]
 pub unsafe fn sol_sha256(vals: *const u8, val_len: u64, hash_result: *mut u8) -> u64 {
     const ID: usize = sys_hash("sol_sha256");
+    // SAFETY: on static-syscall targets the runtime binds each syscall to the
+    // address equal to the murmur3 of its name, the convention
+    // `solana-define-syscall` implements, and this signature is the runtime's
+    // `sol_sha256` ABI.
     let f: extern "C" fn(*const u8, u64, *mut u8) -> u64 = unsafe { core::mem::transmute(ID) };
     f(vals, val_len, hash_result)
 }

@@ -13,12 +13,18 @@ use crate::{PublicKey, sha256};
 /// The two instances as the signer sees them. `sign_at` is Construction 3's
 /// Sig with no one-use rule; [`Signer`] supplies the rule.
 pub trait OneTime: Sized {
+    /// The instance's signature type.
     type Signature;
+    /// Leaves per key: 1 or 256.
     const LEAVES: u32;
     /// In the key file, so a file opens only under its own instance.
     const HEIGHT: u8;
+    /// Construction 3 Gen from a 32-byte seed.
     fn from_seed(seed: [u8; 32]) -> Self;
+    /// `root ‖ P`.
     fn public_key(&self) -> PublicKey;
+    /// Construction 3 Sig under `leaf`, recording nothing. `None` when the
+    /// leaf is out of range or every salt misses.
     fn sign_at(&self, leaf: u32, message: &[u8]) -> Option<Self::Signature>;
 }
 
@@ -35,12 +41,16 @@ pub enum SignerError {
     Corrupt,
     /// The record is behind the chain: a restored old copy.
     BelowFloor {
+        /// The file's next leaf.
         next_leaf: u32,
+        /// The chain's last accepted leaf plus one.
         floor: u32,
     },
+    /// Every leaf is spent.
     Exhausted,
     /// All `K` salts missed; the leaf is spent anyway.
     SaltsExhausted,
+    /// The file system refused; the leaf may or may not be recorded.
     Io(io::Error),
 }
 
@@ -95,6 +105,12 @@ pub struct Signer<K: OneTime> {
     last_digest: Option<[u8; 32]>,
 }
 
+impl<K: OneTime> Drop for Signer<K> {
+    fn drop(&mut self) {
+        crate::wipe(&mut self.seed);
+    }
+}
+
 impl<K: OneTime> Signer<K> {
     /// The seed must never have signed; the file is what to back up.
     pub fn create(path: impl AsRef<Path>, seed: [u8; 32]) -> Result<Self, SignerError> {
@@ -122,6 +138,7 @@ impl<K: OneTime> Signer<K> {
         Ok(signer)
     }
 
+    /// Continue from the key file at `path`, holding it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SignerError> {
         let path = path.as_ref().to_path_buf();
         let lock = lock(&path)?;
@@ -167,14 +184,17 @@ impl<K: OneTime> Signer<K> {
         Ok(self)
     }
 
+    /// `root ‖ P`.
     pub fn public_key(&self) -> PublicKey {
         self.key.public_key()
     }
 
+    /// The leaf the next new message spends.
     pub fn next_leaf(&self) -> u32 {
         self.next_leaf
     }
 
+    /// Leaves not yet spent.
     pub fn remaining(&self) -> u32 {
         K::LEAVES - self.next_leaf
     }

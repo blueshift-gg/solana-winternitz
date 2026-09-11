@@ -15,8 +15,10 @@ test.each(vectors.winternitz)('winternitz matches the Rust crate for a $message.
   winternitz.Signature.from(fromHex(signature)).verify(PublicKey.from(fromHex(public_key)), fromHex(message));
 });
 
+const trees = new Map<string, xmss.SecretKey>();
 test.each(vectors.xmss)('xmss matches the Rust crate at leaf $leaf', ({ seed, leaf, message, public_key, signature }) => {
-  const key = xmss.SecretKey.fromSeed(fromHex(seed));
+  const key = trees.get(seed) ?? xmss.SecretKey.fromSeed(fromHex(seed));
+  trees.set(seed, key);
   expect(hex(key.publicKey.bytes)).toBe(public_key);
   const sig = key.signAt(leaf, fromHex(message));
   expect(sig.leaf).toBe(leaf);

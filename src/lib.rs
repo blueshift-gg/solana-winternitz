@@ -1,16 +1,13 @@
-//! Post-quantum hash-based signatures for Solana programs: DKKW25's
-//! generalized XMSS (Construction 3) over target-sum Winternitz
-//! (Construction 6), with SHA-256 in place of the paper's SHA-3 (§7.2).
-//! [`winternitz`] is the tree of height 0, [`xmss`] the tree of height 8;
-//! one code path serves both. On `target_os = "solana"` every hash is the
-//! `sol_sha256` syscall.
+#![doc = include_str!("../README.md")]
+//!
+//! # Reading the source
 //!
 //! Each departure from the paper is marked where it is made: input order
 //! (§7.1–7.2), HMAC for the message hash (§7.2.1), 24-byte chains under
 //! 32-byte nodes (Theorem 1), seed-derived keys and salts (Remark 7).
-//!
-//! [DKKW25]: https://eprint.iacr.org/2025/055
+//! On `target_os = "solana"` every hash is the `sol_sha256` syscall.
 #![no_std]
+#![deny(missing_docs, clippy::undocumented_unsafe_blocks)]
 
 mod sha256;
 mod syscalls;
@@ -62,6 +59,7 @@ const TREE_TWEAK_LENGTH: usize = 6;
 /// `pk = (root, P)` of Construction 3; the root is the leaf at height 0.
 pub const PUBLIC_KEY_LENGTH: usize = NODE_LENGTH + PARAMETER_LENGTH;
 
+/// The one verification error: the verifier does not say why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The salted digest misses the target sum, the leaf is out of range,
@@ -69,8 +67,20 @@ pub enum Error {
     InvalidSignature,
 }
 
+/// `root ‖ P`, 56 bytes: what a program stores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublicKey(pub [u8; PUBLIC_KEY_LENGTH]);
+
+/// Overwrite secret bytes on drop. Volatile writes and a fence so the
+/// compiler cannot elide the store into a value it considers dead.
+#[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
+fn wipe(bytes: &mut [u8]) {
+    for byte in bytes {
+        // SAFETY: `byte` is a valid, aligned, exclusively borrowed `u8`.
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
 
 impl PublicKey {
     fn new(node: &[u8; NODE_LENGTH], parameter: &[u8]) -> Self {

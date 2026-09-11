@@ -6,6 +6,7 @@ use crate::{Chain, ELEMENTS_LENGTH, Error, PublicKey, SALT_LENGTH, encode, leaf_
 /// `(ρ, σ_OTS)` of Construction 3.
 pub const SIGNATURE_LENGTH: usize = SALT_LENGTH + ELEMENTS_LENGTH;
 
+/// A one-time signature, 864 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Signature(pub [u8; SIGNATURE_LENGTH]);
 
@@ -36,7 +37,15 @@ const HEIGHT: u8 = 0;
 pub struct SecretKey(pub [u8; 32]);
 
 #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        crate::wipe(&mut self.0);
+    }
+}
+
+#[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
 impl SecretKey {
+    /// `leaf ‖ P`.
     pub fn public_key(&self) -> PublicKey {
         let parameter = crate::seed::parameter(&self.0, HEIGHT);
         PublicKey::new(

@@ -194,6 +194,12 @@ Choose strict nonce only if the program needs leaves without gaps.
   needs the chain's last accepted leaf.
 - Target sums other than 325 are not covered by the correctness argument
   with the same constants.
+- Signing time depends on the message and seed: the salt grind runs until
+  a candidate hits the target, about 940 tries on average. The count
+  reveals how many candidates missed and nothing else about the seed;
+  verification handles public data only and has no secret to leak.
+  Seeds are overwritten when a key or signer is dropped; transient copies
+  on the stack are not.
 
 ## Design record
 
