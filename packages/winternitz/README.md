@@ -1,7 +1,10 @@
 # `@blueshift-gg/solana-winternitz`
 
-Create post-quantum hash-based signatures that the `solana-winternitz` crate
-verifies on-chain: `winternitz` for one signature per key, `xmss` for 256.
+Create post-quantum hash-based signatures that the `solana-winternitz`
+crate verifies on-chain: `winternitz` for one signature per key, `xmss`
+for 256. DKKW25's generalized XMSS at hash-sig's parameters, Keccak-256
+for SHA3-256; hash-sig's keys and signatures are reproduced byte for
+byte.
 
 ```sh
 bun add @blueshift-gg/solana-winternitz
@@ -24,15 +27,21 @@ const again = Signer.open(xmss.SecretKey, 'tree.key').floor(lastAcceptedOnChain 
 const once = Signer.create(winternitz.SecretKey, 'once.key', randomBytes(32), randomBytes(18)); // the one-leaf case
 ```
 
-The key file is the key: seed, public parameter, next leaf and last
-message in 89 bytes, mode 0600, replaced atomically on every spent leaf. Back up the file, not the seed. `create` takes a fresh 32-byte seed
-and a fresh 18-byte parameter and refuses an existing file; `open` takes only the file, so no key starts at leaf 0 by accident;
-one instance holds a file at a time. A leaf is spent the moment its
-signature leaves the machine, whether or not the transaction lands, so the
-record is written before the signature is computed, and the last message
-signed again returns the same bytes without spending one. `signAt(leaf,
-message)` on either key is the primitive underneath and records nothing.
-Byte getters return copies.
+A message is a 32-byte digest; the program hashes whatever it acts on
+and passes the digest, so sign the same digest. The key file is the key:
+seed, public parameter, next leaf and last message in 89 bytes, mode
+0600, replaced atomically on every spent leaf. Back up the file, not the
+seed. `create` takes a fresh 32-byte seed and a fresh 18-byte parameter
+and refuses an existing file; `open` takes only the file, so no key
+starts at leaf 0 by accident. One process holds a file at a time through
+a `.lock` sidecar carrying its pid, the same protocol as the Rust
+signer, so the two honour each other's locks. A leaf is spent the moment
+its signature leaves the machine, whether or not the transaction lands,
+so the record is written before the signature is computed, and the last
+message signed again returns the same bytes without spending one.
+`signAt(leaf, message)` on either key is the primitive underneath: it
+records nothing and refuses a leaf out of range. Byte getters return
+copies.
 
 The repository's [SPEC.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SPEC.md)
 defines every byte and [SECURITY.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SECURITY.md)

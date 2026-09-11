@@ -4,16 +4,17 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/blueshift-gg/solana-winternitz/blob/main/LICENSE)
 
 Post-quantum hash-based signatures for Solana programs, verified with the
-`sol_keccak256` syscall alone. Generalized XMSS over target-sum
+`sol_keccak256` syscall alone: generalized XMSS over target-sum
 Winternitz, Constructions 3 and 6 of
 [Drake, Khovratovich, Kudinov and Wagner, IACR CiC 2025](https://eprint.iacr.org/2025/055),
-with the paper's SHA-3 instantiation (§7.2, Keccak-256 for SHA3-256), its
-§8 operating point, and the parameters, key derivation and 32-byte
-messages of the authors' implementation
-[hash-sig](https://github.com/b-wagn/hash-sig), at the 128-bit classical
-and 64-bit quantum level (Corollary 2, Parameter Requirements 2 and 3).
-hash-sig's keys and signatures are reproduced here byte for byte.
-Research code, not audited.
+in the paper's SHA-3 instantiation (§7.2) at its §8 operating point, with
+the parameters, key derivation and 32-byte messages of the authors'
+implementation [hash-sig](https://github.com/b-wagn/hash-sig). Keccak-256
+stands in for SHA3-256, the one substitution the platform forces; with
+that substitution, hash-sig's keys and signatures are reproduced here
+byte for byte. The security level is the paper's 128 bits classical and
+64 bits quantum (Corollary 2, Parameter Requirements 2 and 3). Research
+code, not audited.
 
 | Instance | Signatures per key | Signature | Public key | Verify CU |
 |---|---:|---:|---:|---:|
@@ -21,13 +22,15 @@ Research code, not audited.
 | `xmss` | 256, one per leaf | 1,037 B | 41 B | 35,971 |
 
 `winternitz` is the tree of height 0, `xmss` the tree of height 8; one
-code path serves both. Verification is constant work: the message hash,
+code path serves both. Verification is constant work: one message hash,
 243 chain steps, one leaf hash, one node hash per tree level.
 
-- [SPEC.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SPEC.md): every byte from seed to signature, the key file, the
-  vectors, and where this departs from the paper.
-- [SECURITY.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SECURITY.md): the claim, the assumptions behind it, the
-  arguments and measurements that support them, and what is not proven.
+- [SPEC.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SPEC.md):
+  every byte from seed to signature, the key file and its lock, the
+  vectors, and what differs from the paper and from hash-sig.
+- [SECURITY.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SECURITY.md):
+  the claim, the model, the bound at these parameters, the assumptions
+  behind it, and what is not proven.
 
 ## Verify on-chain
 
@@ -49,11 +52,12 @@ sig.verify(&PublicKey(stored), &message)?;
 last_leaf = sig.leaf(); // in the same instruction
 ```
 
-The crate is `no_std` with no on-chain dependencies. A message is a
-32-byte digest, the paper's fixed message length and hash-sig's: the
-program hashes whatever it acts on and passes the digest. `verify` returns
-`Err(Error::InvalidSignature)` for any failure, with no distinction between
-a wrong message, a wrong key and corrupted bytes.
+A message is a 32-byte digest, the paper's fixed message length and
+hash-sig's: the program hashes whatever it acts on, with `sol_keccak256`
+or any collision-resistant hash, and passes the digest. The crate is
+`no_std` with no on-chain dependencies. `verify` returns
+`Err(Error::InvalidSignature)` for any failure, with no distinction
+between a wrong message, a wrong key and corrupted bytes.
 
 ## Sign off-chain
 
@@ -78,14 +82,15 @@ const once = Signer.create(winternitz.SecretKey, 'once.key', randomBytes(32), ra
 ```
 
 The same `Signer` exists in Rust behind the `sign` feature, with
-`create`, `open`, `floor`, `sign`, `public_key` and `remaining`, and the
-two read each other's key files. The key file is the key: it holds the
-seed, the public parameter, the next leaf and the last message, so back
-up the file, not the seed. `create` takes a fresh seed
-and a fresh 18-byte parameter, the paper's `sk` and `P`, and refuses an
-existing file; `open` takes only a file; one instance holds a file at a
-time. `signAt` and `sign_at` sign under an explicit leaf and
-record nothing; they exist for tests and vectors.
+`create`, `open`, `floor`, `sign`, `public_key`, `next_leaf` and
+`remaining`. The two read each other's key files and honour each other's
+locks. The key file is the key: seed, public parameter, next leaf and
+last message in 89 bytes, so back up the file, not the seed. `create`
+takes a fresh 32-byte seed and a fresh 18-byte parameter, the paper's
+`sk` and `P`, and refuses an existing file. `open` takes only a file.
+One process holds a file at a time, through a `.lock` sidecar carrying
+its pid. `signAt` and `sign_at` sign under an explicit leaf and record
+nothing; they exist for tests and vectors.
 
 ## Rules
 
@@ -99,6 +104,8 @@ record nothing; they exist for tests and vectors.
   that reached any RPC has spent its leaf, landed or not.
 - A leaf index is a counter, the paper's epoch. Never derive it from a
   slot or the Solana epoch.
+- One seed per key. The two instances built from one seed and parameter
+  share leaf 0, as hash-sig keys of different lifetimes do.
 
 ## Parameters
 
@@ -107,31 +114,35 @@ record nothing; they exist for tests and vectors.
 | Chains `v` | 36 | hash-sig's 18-byte message hash: 144 bits ≥ 138, eq. (13) |
 | Chain positions `2^w` | 16 | one nibble per chain |
 | Target sum `T` | 297 | `δ = 1.1`, §8: 243 verifier steps, ~111 salts per signature |
+| Salt trials `K` | 4096 | §8; all miss once in e^36.8 |
 | Chain element `n` | 23 B | ≥ 183 bits at lifetime 2^8, eq. (15) |
 | Public parameter `P` | 18 B | ≥ 142 bits, eq. (16) |
 | Salt `ρ` | 21 B | ≥ 168 bits at lifetime 2^8 with 4096 trials, eq. (14) |
-| Tree height | 8 | 256 leaves |
+| Message | 32 B | hash-sig's `MESSAGE_LENGTH`, the paper's fixed `l_msg` |
+| Tree height | 0 or 8 | 1 or 256 leaves |
 
-The bounds are what the authors'
+The lengths are what the authors'
 [parameter script](https://github.com/b-wagn/hashsig-parameters) prints
-for these inputs, rounded up to bytes as hash-sig does, and the tests
-pin them. At lifetime 2^18 hash-sig's own SHA-3 instantiation has the
+for these inputs, rounded up to bytes as hash-sig does; the tests pin
+the bounds. At lifetime 2^18 hash-sig's own SHA-3 instantiation has the
 same `v`, `w`, `P` and `δ`, with longer chain elements and salts for the
 longer lifetime.
 
 ## Tests
 
 `cargo test --lib` pins the four parameter bounds, Keccak-256 against its
-known answers, the syscall ids, hash-sig's key, public key and
-signatures reproduced from
+known answers, the syscall id, hash-sig's key, public key and signatures
+reproduced from
 [`tests/hash-sig.json`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/hash-sig.json),
 both instances against
-[`tests/vectors.json`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/vectors.json) and the key file
-[`tests/winternitz.key`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/winternitz.key), rejection of every
-single-byte tamper, and the signer's rules. The TypeScript package is a second implementation written
-from `SPEC.md`, sharing no code, that must reproduce every vector.
-`tests/sbpf.rs` measures the verifiers as SBPF programs under Mollusk and
-needs `cargo build-sbf`.
+[`tests/vectors.json`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/vectors.json)
+and the key file
+[`tests/winternitz.key`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/winternitz.key),
+rejection of every single-byte tamper, and the signer's rules and lock
+protocol. The TypeScript package is a second implementation written from
+`SPEC.md`, sharing no code, that must reproduce every vector and the
+hash-sig key. `tests/sbpf.rs` measures the verifiers as SBPF programs
+under Mollusk and needs `cargo build-sbf`.
 
 ```sh
 cargo test --lib

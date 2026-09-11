@@ -2,7 +2,7 @@
 
 This document states the security claim of the crate, the model in which
 it holds, the bound it rests on evaluated at the implemented parameters,
-the arguments for each point at which the implementation departs from
+the arguments for each point at which the implementation differs from
 [DKKW25] and its reference implementation [hash-sig], the attacks that
 were considered with their costs, the operational assumptions the model
 requires, and what remains unproven. The code has not been audited.
@@ -14,9 +14,9 @@ The crate implements the generalized XMSS signature of [DKKW25,
 Construction 3] with the target-sum encoding of [DKKW25, Construction 6]
 and lifetime `L ∈ {1, 2^8}`, in the SHA-3 instantiation of [DKKW25, §7.2]
 with Keccak-256 in place of SHA3-256 (§4.1). Tweaks are the byte strings
-of §7.1; `ℓ` is the leaf index, the paper's epoch; messages are 32-byte
-digests, `l_msg = 256` as in [hash-sig], with the compression of longer
-inputs left to the caller as Remark 1 prescribes. The lengths and the
+of §7.1; `ℓ` is the leaf index, the paper's epoch. Messages are 32-byte
+digests, `l_msg = 256` as in [hash-sig], the compression of longer
+inputs being the caller's as Remark 1 prescribes. The lengths and the
 key derivation are those of [hash-sig]'s SHA-3 target-sum instantiation
 for `w = 4`, the lengths recomputed for these lifetimes.
 
@@ -39,6 +39,9 @@ Requirements are Parameter Requirements 2 and 3 of [DKKW25] at
 output of [hashsig-parameters] for these inputs, rounded up to bytes as
 [hash-sig] rounds. `v = 36` is [hash-sig]'s 18-byte message hash; the
 bound alone allows 35, which no whole-byte truncation of the hash gives.
+Parameter Requirement 3 is stated for `L, v ≥ 2`; the `winternitz`
+instance at `L = 1` uses the `L = 2^8` widths, which meet every
+requirement at `L = 1` since each bound is non-decreasing in `log L`.
 
 `T = 297` exceeds the mean nibble sum `270` by the factor `δ = 1.1` of
 [DKKW25, §8] and [hash-sig]'s `Off10` instantiations. By Lemma 7 the set
@@ -101,26 +104,27 @@ quantum:    Adv − Δ_PRF ≤ α·t² + β·t + γ·√t,
             α = 8/2^144 + 96/2^144 + (96 + 8·a_L)/2^184 ≈ 2^-137.3,
             β = 12·a_L·(2^w + 1)/2^92 ≈ 2^-67.2,
             γ = (3/2)·pK/2^84 ≈ 2^-63.4,
-            so Adv/t ≤ 2^-67.1 for 2^20 ≤ t ≤ 2^64 and ≤ 1/t beyond.
+            so (Adv − Δ_PRF)/t ≤ 2^-67.1 for 2^20 ≤ t ≤ 2^64 and ≤ 1/t beyond.
 ```
 
-The `6/2^144` and `96/2^144` terms are the `2q/|P|` and `32q²/|P|` parts of
-the collision bounds, one for `T₁` and two for `T₃`: the classical level,
-141 bits, is set by the parameter and digest widths together, both 144
-bits as eqs. (13) and (16) require. The quantum level is the 64-bit
-target, with 67 bits in the regime where the bound is not trivial; the
-`γ` term is why `t` is taken at or above `pK`, the signing oracle's own
-hashing. `Δ_PRF` is not quantified and stays on the left of both
-inequalities; §4.2 states what it assumes. The
-application's hash of its payload into the 32-byte message is outside
-the bound: a chosen-message collision on it costs `2^128` classically and
-about `2^85` quantumly, at and above the targets, and is A4's concern.
-These are
-heuristic figures in the sense of the paper: the properties in the table
-are standard-model assumptions on Keccak-256 under these input layouts,
-and Table 1 estimates them by modelling the hash as a random oracle.
+The `6/2^144` and `96/2^144` terms are the `2q/|P|` and `32q²/|P|` parts
+of the collision bounds, one for `T₁` and two for `T₃`: the classical
+level, 141 bits, is set by the parameter and digest widths together,
+both 144 bits as eqs. (13) and (16) require. The quantum level is the
+64-bit target, with 67 bits in the regime where the bound is not
+trivial; the `γ` term is why `t` is taken at or above `pK`, the charged
+cost of the signing queries. `Δ_PRF` is not quantified and stays on the
+left of both inequalities; §4.2 states what it assumes.
 
-## 4. Departures from the paper and hash-sig
+Two things are outside the bound. The application's hash of its payload
+into the 32-byte message: a chosen-message collision on it costs `2^128`
+classically and about `2^85` quantumly, at and above the targets, and is
+A4's concern. And the model itself: these are heuristic figures in the
+sense of the paper, the properties in the table being standard-model
+assumptions on Keccak-256 under these input layouts, estimated by Table 1
+with the hash modelled as a random oracle.
+
+## 4. Differences from the paper and from hash-sig
 
 What is not the paper's or hash-sig's, each treated below or in §6: the
 hash function (§4.1); salts from the PRF where the paper samples them, as
@@ -128,10 +132,7 @@ hash-sig does (§4.2); lifetimes `2^0` and `2^8` with lengths recomputed
 from the authors' script, where hash-sig ships `2^18` and up; `K = 4096`,
 §8's parameter-setting assumption, where hash-sig allows 100 000 and
 produces the same salts up to there; the wire formats, which carry the
-epoch inside the signature, and the signer's key file (§6). Parameter
-Requirement 3 is stated for `L, v ≥ 2`; the `winternitz` instance at
-`L = 1` uses the `L = 2^8` widths, which meet every requirement at `L = 1`
-since each bound is non-decreasing in `log L`.
+epoch inside the signature, and the signer's key file and lock (§6).
 
 ### 4.1 Keccak-256 for SHA3-256
 
@@ -164,8 +165,8 @@ supports the suffixed function from the plain one, not the converse.
 **Why not SHA3-256 itself.** Solana has no SHA3-256 syscall. SHA3-256 in
 software on the SBPF target measures about 11,600 CU per call, and one
 verification makes 245 or 253 calls; both verifiers exhausted the
-1,400,000 CU transaction maximum (§8). The suffix cannot be produced through the
-Keccak-256 syscall, which appends its own padding.
+1,400,000 CU transaction maximum (§8). The suffix cannot be produced
+through the Keccak-256 syscall, which appends its own padding.
 
 ### 4.2 Seed-derived chain starts and salts
 
@@ -193,10 +194,11 @@ unpredictable and yields one grinding attempt.
 The PRF is keyed by the seed alone, as [hash-sig]'s is, so the
 `winternitz` key and the `xmss` key built from one seed and one `P` share
 leaf 0, exactly as two [hash-sig] keys of different lifetimes built from
-one PRF key would. A5 therefore requires one seed per key, which the
-`Signer` API makes the natural use. The pseudorandomness of `Φ_seed`,
-classical and quantum, is an assumption of this crate, as the
-pseudorandomness of `ShaPRF` is one of [hash-sig].
+one PRF key would. A5 therefore requires one seed per key. The
+pseudorandomness of `Φ_seed`, classical and quantum, is an assumption of
+this crate, as the pseudorandomness of `ShaPRF` is one of [hash-sig]; a
+quantum distinguisher also evaluates the public hash, so the assumption
+must be made in that setting.
 
 ### 4.3 Domain separation
 
@@ -209,7 +211,8 @@ whatever their content, and within a role the fixed-width tweak
 separates positions. The message input begins with the salt, which a
 forger chooses, exactly as in §7.2.1; the paper's own note applies, that
 no domain separation between the spaces of the two functions is added,
-and none of the reductions in §3 requires it.
+and none of the reductions in §3 requires it. The argument is specific
+to these lengths; another parameter set needs its own.
 
 ## 5. Attacks considered
 
@@ -258,10 +261,10 @@ crate enforces it and what §5 says about its violation.
   all of this and is for tests. Violation: leaf reuse, §5.
 - **A2, integrity of the signer's record.** The record holds the seed,
   `P`, the next leaf and the last message; a copy older than the latest
-  signature reintroduces A1's violation. Not detectable
-  locally; a lower bound from the verifier's last accepted leaf is checked
-  by `floor`. Backups are of the record, never of the seed alone. Cf.
-  [SP800-208, §8] on state management.
+  signature reintroduces A1's violation. Not detectable locally; a lower
+  bound from the verifier's last accepted leaf is checked by `floor`.
+  Backups are of the record, never of the seed alone. Cf. [SP800-208,
+  §8] on state management.
 - **A3, verifier leaf policy.** The verifier retires leaves whose
   signatures are public, since a signature stays valid until it does. A
   strictly increasing leaf index retires every lower leaf on acceptance,
@@ -294,6 +297,8 @@ crate enforces it and what §5 says about its violation.
   copies are not.
 - Correctness with these constants is argued for `T = 297`; other targets
   change `η_T` and the required `K`.
+- Mutual exclusion between the two signer implementations is checked
+  outside CI (§8).
 
 ## 8. Verification record
 
@@ -307,12 +312,14 @@ key and parameter (`tests/hash-sig.json`); the vector corpus reproduced
 by two implementations sharing no code; the SBPF verifier under Mollusk
 against host-generated signatures, 34 331 and 35 971 CU; the lock
 protocol against a live pid, an empty file, garbage and a dead pid in
-both packages. Checked outside CI through the public APIs: each package
-refuses a key file the other holds, in both acquisition orders, and
-opens it once released. Reproduced in this analysis: the leaf-reuse forgeries of §5 at full parameters,
-accepted by the verifier; software SHA3-256 on the SBPF target exhausting
-1 400 000 CU in one verification, 12 454 CU for the single message hash
-of a rejected signature.
+both packages.
+
+Checked outside CI through the public APIs: each package refuses a key
+file the other holds, in both acquisition orders, and opens it once
+released. Reproduced in this analysis: the leaf-reuse forgeries of §5 at
+full parameters, accepted by the verifier; software SHA3-256 on the SBPF
+target exhausting 1 400 000 CU in one verification, 12 454 CU for the
+single message hash of a rejected signature.
 
 ## 9. Alternatives considered
 
@@ -330,7 +337,9 @@ the record. Messages of any length hashed inside `Th_msg`, with a height
 label in the PRF separating the two instances: rejected in favour of
 [hash-sig]'s layout, which the tests now reproduce; the salted `2^144`
 bound on the message becomes the application's `2^128` collision bound
-on its payload hash, the paper's own arrangement. Classical Winternitz
+on its payload hash, the paper's own arrangement. An OS advisory lock on
+the sidecar: rejected, Node has none, and two protocols on one file let
+each implementation open a file the other held. Classical Winternitz
 with checksum chains, Construction 5: more chains and variable verifier
 work. Resuming a restored seed at a margin above the verifier's last
 accepted leaf: rejected, a guess (A2).

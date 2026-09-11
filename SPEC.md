@@ -2,10 +2,12 @@
 
 Every byte of the scheme as implemented, for a second implementer. The
 TypeScript package was written from this document and must reproduce
-[`tests/vectors.json`](tests/vectors.json) and
+[`tests/vectors.json`](tests/vectors.json),
+[`tests/hash-sig.json`](tests/hash-sig.json) and
 [`tests/winternitz.key`](tests/winternitz.key). References are to
 [DKKW25](https://eprint.iacr.org/2025/055) and to its reference
-implementation [hash-sig](https://github.com/b-wagn/hash-sig).
+implementation [hash-sig](https://github.com/b-wagn/hash-sig) at commit
+`e66a485`.
 
 ## Parameters
 
@@ -14,12 +16,12 @@ implementation [hash-sig](https://github.com/b-wagn/hash-sig).
 | `v` | 36 | chains, one per nibble of hash-sig's 18-byte message hash |
 | `2^w` | 16 | chain positions, `w = 4` |
 | `T` | 297 | required nibble sum, `⌈1.1 · 36 · 15 / 2⌉`, Construction 6 at §8's `δ = 1.1` |
+| `K` | 4096 | salt trials before signing fails, §8 |
 | `n` | 23 B | chain element, leaf and node |
 | `P` | 18 B | public parameter |
 | `ρ` | 21 B | salt |
 | `l_msg` | 32 B | message, hash-sig's `MESSAGE_LENGTH`: the caller's digest of what it acts on (Remark 1) |
 | `h` | 0 or 8 | tree height: `winternitz`, `xmss` |
-| `K` | 4096 | salt trials before signing fails, §8 |
 
 The hash is Keccak-256, the `sol_keccak256` syscall, standing in for the
 paper's SHA3-256 (§7.2): the same permutation, rate and capacity, padding
@@ -38,7 +40,7 @@ are Remark 7's PRF over the seed with hash-sig's `ShaPRF` layout: its
 a purpose byte, the key, the epoch, then the chain index as a `u64` or the
 message and a `u64` counter. These are hash-sig's `ShaTweakHash<18, 23>`,
 `ShaMessageHash<18, 21, 36, 4>` and `ShaPRF<23, 21>` with the hash
-swapped; `tests/hash-sig.json` holds its key and signatures.
+swapped.
 
 | Role | Input | Output |
 |---|---|---|
@@ -69,7 +71,8 @@ public key = root ‖ P,  root = leaf[0] when h = 0, node[h][0] when h = 8
 
 `step(ℓ, i, k, x)` is the chain-step hash with position `k`: the step
 into position `k` carries tweak `k`, as hash-sig's `chain` and
-Construction 2.
+Construction 2. The PRF is keyed by the seed alone, so the two instances
+built from one seed and one `P` share leaf 0; a seed serves one key.
 
 ## Signing
 
@@ -85,6 +88,9 @@ as hash-sig's:
    position `x_i`; `σ_i = sk[ℓ][i]` when `x_i = 0`.
 4. `xmss` only: the authentication path, `node[l][(ℓ >> l) ^ 1]` for
    `l = 0 … 7`, leaf level first.
+
+The raw operation, `sign_at` and `signAt`, refuses `ℓ ≥ 2^h` and records
+nothing.
 
 ## Verification
 
@@ -108,15 +114,29 @@ Construction 3 Ver, constant work for an accepted signature:
 | `xmss` signature | `ℓ(4) ‖ ρ(21) ‖ σ_0 ‖ … ‖ σ_35 ‖ path_0 ‖ … ‖ path_7` | 1,037 |
 | key file | `version(1) = 1 ‖ h(1) ‖ seed(32) ‖ P(18) ‖ next leaf(4) ‖ message flag(1) ‖ last message(32)` | 89 |
 
-The key file is written with mode 0600 and replaced atomically: temp
-file, fsync, rename, directory fsync. A `.lock` sidecar next to it holds
-the open signer's pid and is created exclusively, the same protocol in
-both packages: a live or unreadable owner refuses, a dead owner's lock is
-renamed away and removed, so that of two openers clearing it at once only
-one can go on to create. It assumes one pid namespace. The last message
-signed is stored
-whole, flag 0 before the first signature. `h` tags the instance so a file
-opens only under its own; it enters no derivation.
+## Key file and lock
+
+The key file is created with mode 0600 and replaced atomically on every
+spent leaf: temp file `<file>.tmp`, fsync, rename, directory fsync. The
+message flag is 0 before the first signature and 1 after, with the last
+message signed stored whole. `h` tags the instance so a file opens only
+under its own; it enters no derivation.
+
+The open signer holds `<file>.lock`, the same protocol in both packages:
+
+1. Create `<file>.lock` exclusively (`O_EXCL`, mode 0600) and write the
+   decimal pid of the process. On success the lock is held.
+2. If the file exists, read it. If the content is not a positive integer,
+   or names a live process (`kill(pid, 0)` succeeds or fails with
+   `EPERM`), refuse: the owner is alive or between creating the file and
+   writing its pid.
+3. Otherwise rename it to `<file>.lock.stale`, remove that, and go to
+   step 1 once more. A second existing file refuses.
+
+Release removes `<file>.lock`. Of two openers clearing a dead owner's
+lock at once, only the one whose rename succeeds can go on to create.
+Pids are meaningful within one pid namespace: signers of one file share a
+host.
 
 ## Vectors
 
@@ -138,14 +158,16 @@ from `StdRng` seed 2025; the `source` field records this. Both packages
 build the key from the PRF key and parameter and reproduce the public key
 and every signature byte for byte.
 
-## Departures from the paper and hash-sig
+## Differences from the paper and from hash-sig
 
 | Where | Paper / hash-sig | Here | Why |
 |---|---|---|---|
-| hash function | SHA3-256 (§7.2), `sha3::Sha3_256` | Keccak-256 | the sponge Solana provides; software SHA3-256 exhausts the transaction budget; see SECURITY.md |
-| chain starts and salts | sampled (Construction 3), any PRF for starts (Remark 7); hash-sig's `ShaPRF` | hash-sig's `ShaPRF` | one seed per key; see SECURITY.md |
+| hash function | SHA3-256 (§7.2), `sha3::Sha3_256` | Keccak-256 | the sponge Solana provides; software SHA3-256 exhausts the transaction budget; SECURITY.md §4.1 |
+| chain starts and salts | sampled (Construction 3), any PRF for starts (Remark 7); hash-sig's `ShaPRF` | hash-sig's `ShaPRF` | SECURITY.md §4.2 |
 | lifetime | 2^18 and up in hash-sig's instantiations | 2^0 and 2^8 | lengths from the same script at these lifetimes |
 | salt trials | `K ≤ 4096` (§8); 100 000 in hash-sig | 4096 | the paper's; the same salts up to there |
+| wire format | epoch supplied beside the signature | epoch inside the `xmss` signature, absent at height 0 | one buffer per instruction |
+| key file, lock | none | above | local additions |
 
 Everything else is hash-sig's, and its keys and signatures are
 reproduced here.
