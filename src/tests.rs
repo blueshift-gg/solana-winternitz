@@ -291,8 +291,7 @@ const NEXT_LEAF: usize = 2 + 32 + PARAMETER_LENGTH;
 
 /// The signer's rules: one instance per file, no open without a file, the
 /// last message repeated for free, and foreign, truncated, behind-the-chain
-/// and exhausted files all refused; the lock protocol shared with the
-/// TypeScript package: an existing lock refuses, whatever it holds.
+/// and exhausted files all refused.
 #[test]
 fn signer_owns_leaf_allocation() {
     use crate::{Signer, SignerError};
@@ -350,20 +349,11 @@ fn signer_owns_leaf_allocation() {
     std::fs::write(dir.join("tree.key.tmp"), b"garbage").unwrap();
     assert_eq!(Tree::open(&path).unwrap().next_leaf(), 3);
 
-    // The lock file: whatever it holds, a live pid, a dead one, nothing or
-    // garbage, an existing lock refuses; only its removal by hand opens
-    // the file again; a released lock is gone.
+    // The lock is the kernel's, not the sidecar's existence or content.
     let lock = dir.join("tree.key.lock");
-    let pid = std::format!("{}", std::process::id());
-    for owner in [pid.as_str(), "999999999", "", "abc"] {
-        std::fs::write(&lock, owner).unwrap();
-        assert!(matches!(Tree::open(&path), Err(SignerError::Locked)));
-        std::fs::remove_file(&lock).unwrap();
-    }
-    let held = Tree::open(&path).unwrap();
-    assert_eq!(std::fs::read_to_string(&lock).unwrap(), pid);
-    drop(held);
-    assert!(!lock.exists());
+    std::fs::write(&lock, "anything").unwrap();
+    drop(Tree::open(&path).unwrap());
+    assert!(lock.exists());
     let record = std::fs::read(&path).unwrap();
     std::fs::write(&path, &record[..record.len() - 1]).unwrap();
     assert!(matches!(Tree::open(&path), Err(SignerError::Corrupt)));
@@ -389,6 +379,46 @@ fn signer_owns_leaf_allocation() {
     assert_eq!(once.sign(&a).unwrap(), s);
     assert!(matches!(once.sign(&b), Err(SignerError::Exhausted)));
     drop(once);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The child of `lock_dies_with_its_holder`: hold the key file named by
+/// the environment until killed.
+#[test]
+fn hold_key_file() {
+    let Ok(path) = std::env::var("SOLANA_WINTERNITZ_HOLD") else {
+        return;
+    };
+    let _held = crate::Signer::<winternitz::SecretKey>::open(&path).unwrap();
+    std::println!("HOLDING");
+    loop {
+        std::thread::sleep(core::time::Duration::from_secs(1));
+    }
+}
+
+/// The kernel holds the lock for the process that took it and releases it
+/// when that process dies: a file held by another process is refused, and
+/// opens after the process is killed.
+#[test]
+fn lock_dies_with_its_holder() {
+    use crate::{Signer, SignerError};
+    use std::io::BufRead;
+    type Once = Signer<winternitz::SecretKey>;
+    let dir = temp_dir("holder");
+    let path = dir.join("once.key");
+    drop(Once::create(&path, seed(6), parameter(6)).unwrap());
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::hold_key_file", "--nocapture"])
+        .env("SOLANA_WINTERNITZ_HOLD", &path)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    assert!(lines.any(|line| line.unwrap() == "HOLDING"));
+    assert!(matches!(Once::open(&path), Err(SignerError::Locked)));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(Once::open(&path).unwrap());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

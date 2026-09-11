@@ -122,14 +122,19 @@ message flag is 0 before the first signature and 1 after, with the last
 message signed stored whole. `h` tags the instance so a file opens only
 under its own; it enters no derivation.
 
-The open signer holds `<file>.lock`, the same protocol in both packages:
-create it exclusively (`O_EXCL`, mode 0600) and write the decimal pid of
-the process; if it exists, refuse, whatever it holds. Release removes it.
-A signer never removes a lock it did not create: a lock left by a crashed
-process is removed by hand once the pid inside is confirmed dead, with
-no signer running. Any automatic recovery reads the file and then acts
-on whatever is at that path, which a concurrent creator can have
-replaced in between, so exclusion rests on the one atomic operation.
+The open signer holds a kernel lock on `<file>.lock`, the same in both
+packages: open or create the sidecar without truncating it, take
+`flock(LOCK_EX | LOCK_NB)` on that descriptor, Rust's `File::try_lock`
+and libc's `flock` through Bun's FFI, and keep the descriptor for the
+signer's lifetime; a contended lock refuses before the record is read.
+Release closes the descriptor. The sidecar is permanent and is never
+deleted, renamed or replaced, since a new file at the path would be a
+second lock; its existence and content mean nothing. When a holder dies
+the kernel releases the lock and the next signer resumes from the
+record's next leaf. `flock` is advisory and per host: signers of one
+file share a host and a local filesystem. The TypeScript signer needs
+Bun on a unix host for the call; verification and key generation run
+anywhere.
 
 ## Vectors
 

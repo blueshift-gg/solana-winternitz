@@ -34,10 +34,11 @@ seed, public parameter, next leaf and last message in 89 bytes, mode
 seed. `create` takes a fresh 32-byte seed and a fresh 18-byte parameter
 and refuses an existing file; `open` takes only the file, so no key
 starts at leaf 0 by accident. One process holds a file at a time through
-a `.lock` sidecar created exclusively, the same protocol as the Rust
-signer, so the two honour each other's locks; a lock left by a crash is
-removed by hand once the pid inside is dead, never by a signer. A leaf
-is spent the moment
+a kernel lock, `flock`, on a permanent `.lock` sidecar, the same call
+the Rust signer makes, so the two honour each other's locks and the OS
+releases a dead holder's. `Signer` reaches `flock` through Bun's FFI, so
+it needs Bun on a unix host; verification and key generation run
+anywhere. A leaf is spent the moment
 its signature leaves the machine, whether or not the transaction lands,
 so the record is written before the signature is computed, and the last
 message signed again returns the same bytes without spending one.

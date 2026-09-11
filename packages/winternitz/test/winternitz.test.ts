@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test';
 import vectors from '../../../tests/vectors.json' with { type: 'json' };
 import reference from '../../../tests/hash-sig.json' with { type: 'json' };
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -90,8 +92,8 @@ test('the signer owns leaf allocation', () => {
 
   const signer = Signer.create(xmss.SecretKey, path, seed, parameter);
   expect(signer.remaining).toBe(xmss.LEAVES);
-  expect(() => Signer.create(xmss.SecretKey, path, seed, parameter)).toThrow('locked');
-  expect(() => Signer.open(xmss.SecretKey, path)).toThrow('locked');
+  expect(() => Signer.create(xmss.SecretKey, path, seed, parameter)).toThrow('held by another signer');
+  expect(() => Signer.open(xmss.SecretKey, path)).toThrow('held by another signer');
 
   const a = signer.sign(m(1));
   expect(a.leaf).toBe(0);
@@ -117,18 +119,12 @@ test('the signer owns leaf allocation', () => {
 
   // Interrupted write: stale temp ignored, truncated record refused.
   writeFileSync(`${path}.tmp`, 'garbage');
-  // The lock file: whatever it holds, a live pid, a dead one, nothing or garbage, an existing lock refuses;
-  // only its removal by hand opens the file again; close removes it.
-  for (const owner of [String(process.pid), '999999999', '', 'abc']) {
-    writeFileSync(`${path}.lock`, owner);
-    expect(() => Signer.open(xmss.SecretKey, path)).toThrow('locked');
-    rmSync(`${path}.lock`);
-  }
+  // The lock is the kernel's, not the sidecar's existence or content.
+  writeFileSync(`${path}.lock`, 'anything');
   const after = Signer.open(xmss.SecretKey, path);
   expect(after.nextLeaf).toBe(3);
-  expect(readFileSync(`${path}.lock`, 'utf8')).toBe(String(process.pid));
   after.close();
-  expect(existsSync(`${path}.lock`)).toBe(false);
+  expect(existsSync(`${path}.lock`)).toBe(true);
   const record = readFileSync(path);
   writeFileSync(path, record.subarray(0, record.length - 1));
   expect(() => Signer.open(xmss.SecretKey, path)).toThrow('not a record of this instance');
@@ -155,6 +151,26 @@ test('the signer owns leaf allocation', () => {
   once.close();
   rmSync(dir, { recursive: true });
 }, 60_000); // builds the 256-leaf key on every open
+
+test('the lock dies with its holder', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'solana-winternitz-'));
+  const path = join(dir, 'once.key');
+  Signer.create(winternitz.SecretKey, path, new Uint8Array(32), new Uint8Array(PARAMETER_LENGTH)).close();
+  const source = new URL('../src/index.ts', import.meta.url).pathname;
+  const holder = spawn(process.execPath, [
+    '-e',
+    `const { Signer, winternitz } = await import(${JSON.stringify(source)}); Signer.open(winternitz.SecretKey, ${JSON.stringify(path)}); console.log('HOLDING'); await new Promise(() => {});`,
+  ]);
+  await new Promise<void>((resolve, reject) => {
+    holder.stdout.on('data', (chunk: Buffer) => chunk.toString().includes('HOLDING') && resolve());
+    holder.on('exit', (code) => reject(new Error(`holder exited with ${code}`)));
+  });
+  expect(() => Signer.open(winternitz.SecretKey, path)).toThrow('held by another signer');
+  holder.kill('SIGKILL');
+  await once(holder, 'exit');
+  Signer.open(winternitz.SecretKey, path).close();
+  rmSync(dir, { recursive: true });
+}, 30_000);
 
 test('the key file written by the Rust crate opens here', () => {
   const dir = mkdtempSync(join(tmpdir(), 'solana-winternitz-'));

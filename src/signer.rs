@@ -5,7 +5,7 @@
 //! file opens only from itself. The file holds the seed and `P`, which
 //! Construction 3 samples independently and the caller supplies.
 
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -36,8 +36,7 @@ pub enum SignerError {
     Exists,
     /// `open` with no key file: a seed cannot say which leaves are spent.
     Missing,
-    /// `<file>.lock` exists: another signer holds the file, or a crashed
-    /// one left it. Remove it by hand once the pid inside is dead.
+    /// Another signer holds the file.
     Locked,
     /// Wrong length, version or instance height.
     Corrupt,
@@ -69,9 +68,7 @@ impl core::fmt::Display for SignerError {
             Self::Missing => f.write_str(
                 "no key file at this path: a seed alone cannot say which leaves are spent",
             ),
-            Self::Locked => f.write_str(
-                "the key file is locked: held by another signer, or left by a dead one; remove the .lock file by hand once its pid is dead",
-            ),
+            Self::Locked => f.write_str("the key file is held by another signer"),
             Self::Corrupt => f.write_str("the key file is not a record of this instance"),
             Self::BelowFloor { next_leaf, floor } => write!(
                 f,
@@ -106,7 +103,7 @@ pub struct Signer<K: OneTime> {
     seed: [u8; 32],
     parameter: [u8; PARAMETER_LENGTH],
     path: PathBuf,
-    _lock: Lock,
+    _lock: File,
     next_leaf: u32,
     last_message: Option<[u8; MESSAGE_LENGTH]>,
 }
@@ -284,35 +281,25 @@ fn options() -> fs::OpenOptions {
     options
 }
 
-/// The `.lock` sidecar, created exclusively and holding the owner's pid:
-/// the TypeScript package's protocol byte for byte, so each refuses a
-/// file the other holds. A sidecar because rename would orphan a lock on
-/// the record. Removed on drop. A lock left by a crashed process is
-/// removed by hand once its pid is confirmed dead, never by a signer: any
-/// automatic recovery reads the file and then acts on whatever is at that
-/// path, which a concurrent creator can have replaced in between.
-struct Lock(PathBuf);
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+/// The `.lock` sidecar, permanent, held through `flock(LOCK_EX | LOCK_NB)`
+/// for the signer's lifetime: `File::try_lock`, the same call the
+/// TypeScript package makes through Bun's FFI, so each refuses a file the
+/// other holds, and the kernel releases a dead holder's lock, so there is
+/// no stale-owner decision to race on. A sidecar because rename would
+/// orphan a lock on the record; never deleted, since a new file at the
+/// path would be a second lock.
+fn lock(path: &Path) -> Result<File, SignerError> {
+    let file = options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(sibling(path, ".lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(SignerError::Locked),
+        Err(TryLockError::Error(error)) => Err(error.into()),
     }
-}
-
-fn lock(path: &Path) -> Result<Lock, SignerError> {
-    let lock = sibling(path, ".lock");
-    let mut file =
-        options()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::AlreadyExists => SignerError::Locked,
-                _ => SignerError::Io(error),
-            })?;
-    let held = Lock(lock);
-    file.write_all(std::format!("{}", std::process::id()).as_bytes())?;
-    Ok(held)
 }
 
 /// A rename is durable only once its directory is synced.

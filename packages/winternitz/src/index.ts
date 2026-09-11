@@ -4,7 +4,7 @@
 // and `tests/winternitz.key` pin the two together.
 
 import { keccak_256 } from '@noble/hashes/sha3.js';
-import { closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 /** `v`: hash-sig's 18-byte message hash at w = 4, 144 bits ≥ 138, eq. (13). */
@@ -336,19 +336,19 @@ const RECORD = MESSAGE + MESSAGE_LENGTH;
  * Owns leaf allocation, after winterwallet's client. Here because Theorem 1 admits one signature per leaf
  * and neither the seed nor the chain records which leaves are spent: `create` from a fresh seed, `open`
  * from the file only, `sign` records before it signs and repeats the last message for free, `close`
- * releases the file.
+ * releases the file. Needs Bun on a unix host for the kernel lock; see `acquire`.
  */
 export class Signer<S> {
   readonly #key: OneTime<S>;
   readonly #seed: Uint8Array;
   readonly #parameter: Uint8Array;
   readonly #path: string;
-  readonly #lock: string;
+  readonly #lock: number;
   #nextLeaf: number;
   #lastMessage: Uint8Array | undefined;
   #closed = false;
 
-  private constructor(key: OneTime<S>, seed: Uint8Array, parameter: Uint8Array, path: string, lock: string, nextLeaf: number, lastMessage?: Uint8Array) {
+  private constructor(key: OneTime<S>, seed: Uint8Array, parameter: Uint8Array, path: string, lock: number, nextLeaf: number, lastMessage?: Uint8Array) {
     this.#key = key;
     this.#seed = seed;
     this.#parameter = parameter;
@@ -480,39 +480,40 @@ export class Signer<S> {
 }
 
 /**
- * The `.lock` sidecar, created exclusively and holding the owner's pid: the Rust crate's protocol byte for
- * byte, so each refuses a file the other holds. A sidecar because rename would orphan a lock on the record.
- * Removed on close. A lock left by a crashed process is removed by hand once its pid is confirmed dead, never
- * by a signer: any automatic recovery reads the file and then acts on whatever is at that path, which a
- * concurrent creator can have replaced in between.
+ * The `.lock` sidecar, permanent, held through `flock(LOCK_EX | LOCK_NB)` for the signer's lifetime: the same
+ * call the Rust crate makes through `File::try_lock`, so each refuses a file the other holds, and the kernel
+ * releases a dead holder's lock, so there is no stale-owner decision to race on. A sidecar because rename
+ * would orphan a lock on the record; never deleted, since a new file at the path would be a second lock.
+ * `flock` is reached through Bun's FFI: `Signer` needs Bun on a unix host; everything else runs anywhere.
  */
-function acquire(path: string): string {
-  const lock = `${path}.lock`;
-  let fd: number;
-  try {
-    fd = openSync(lock, 'wx', 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      throw new Error(`the key file is locked: held by another signer, or left by a dead one; remove ${lock} by hand once its pid is dead`);
-    }
-    throw error;
-  }
-  try {
-    writeSync(fd, String(process.pid));
+function acquire(path: string): number {
+  const fd = openSync(`${path}.lock`, 'a', 0o600);
+  if (!flock(fd)) {
     closeSync(fd);
-  } catch (error) {
-    release(lock);
-    throw error;
+    throw new Error(`the key file is held by another signer (${path}.lock)`);
   }
-  return lock;
+  return fd;
 }
 
-function release(lock: string): void {
-  try {
-    unlinkSync(lock);
-  } catch {
-    // Already gone: nothing to release.
+function release(fd: number): void {
+  closeSync(fd);
+}
+
+const LOCK_EX = 2;
+const LOCK_NB = 4;
+let libc: { symbols: { flock: (fd: number, operation: number) => number } } | undefined;
+
+function flock(fd: number): boolean {
+  if (typeof Bun === 'undefined' || process.platform === 'win32') {
+    throw new Error('Signer needs Bun on a unix host: the key-file lock is flock(2) through bun:ffi');
   }
+  if (!libc) {
+    const { dlopen, FFIType } = require('bun:ffi') as typeof import('bun:ffi');
+    libc = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {
+      flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    });
+  }
+  return libc.symbols.flock(fd, LOCK_EX | LOCK_NB) === 0;
 }
 
 /** A rename is durable only once its directory is synced. */
