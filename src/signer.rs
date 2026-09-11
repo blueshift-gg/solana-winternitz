@@ -2,13 +2,14 @@
 //! Here because Theorem 1 admits one signature per leaf and neither the
 //! seed nor the chain records which leaves are spent: the record is
 //! written before a signature exists, one instance holds a file, and a
-//! file opens only from itself.
+//! file opens only from itself. The file holds the seed and `P`, which
+//! Construction 3 samples independently and the caller supplies.
 
 use std::fs::{self, File, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{PublicKey, sha256};
+use crate::{MESSAGE_LENGTH, PARAMETER_LENGTH, PublicKey};
 
 /// The two instances as the signer sees them. `sign_at` is Construction 3's
 /// Sig with no one-use rule; [`Signer`] supplies the rule.
@@ -19,13 +20,13 @@ pub trait OneTime: Sized {
     const LEAVES: u32;
     /// In the key file, so a file opens only under its own instance.
     const HEIGHT: u8;
-    /// Construction 3 Gen from a 32-byte seed.
-    fn from_seed(seed: [u8; 32]) -> Self;
+    /// Construction 3 Gen from a 32-byte seed and the sampled parameter `P`.
+    fn new(seed: [u8; 32], parameter: [u8; PARAMETER_LENGTH]) -> Self;
     /// `root ‖ P`.
     fn public_key(&self) -> PublicKey;
     /// Construction 3 Sig under `leaf`, recording nothing. `None` when the
     /// leaf is out of range or every salt misses.
-    fn sign_at(&self, leaf: u32, message: &[u8]) -> Option<Self::Signature>;
+    fn sign_at(&self, leaf: u32, message: &[u8; MESSAGE_LENGTH]) -> Option<Self::Signature>;
 }
 
 /// Every variant fails closed: no signature is released.
@@ -75,7 +76,7 @@ impl core::fmt::Display for SignerError {
             ),
             Self::Exhausted => f.write_str("every leaf is spent"),
             Self::SaltsExhausted => {
-                f.write_str("2^16 salts missed the target sum; the leaf is spent")
+                f.write_str("4096 salts missed the target sum; the leaf is spent")
             }
             Self::Io(error) => write!(f, "{error}"),
         }
@@ -84,14 +85,15 @@ impl core::fmt::Display for SignerError {
 
 impl std::error::Error for SignerError {}
 
-// Key file: version ‖ height ‖ seed ‖ next leaf LE ‖ digest flag ‖ digest,
-// 71 bytes, byte-identical to the TypeScript package's.
+// Key file: version ‖ height ‖ seed ‖ P ‖ next leaf BE ‖ message flag ‖
+// last message, 89 bytes, byte-identical to the TypeScript package's.
 const VERSION: u8 = 1;
 const SEED: usize = 2;
-const NEXT_LEAF: usize = SEED + 32;
-const HAS_DIGEST: usize = NEXT_LEAF + 4;
-const DIGEST: usize = HAS_DIGEST + 1;
-const RECORD: usize = DIGEST + 32;
+const PARAMETER: usize = SEED + 32;
+const NEXT_LEAF: usize = PARAMETER + PARAMETER_LENGTH;
+const HAS_MESSAGE: usize = NEXT_LEAF + 4;
+const MESSAGE: usize = HAS_MESSAGE + 1;
+const RECORD: usize = MESSAGE + MESSAGE_LENGTH;
 
 /// `create` from a fresh seed, `open` from the file, `sign` a message: a
 /// new message spends the next leaf after the record is on disk, the last
@@ -99,10 +101,11 @@ const RECORD: usize = DIGEST + 32;
 pub struct Signer<K: OneTime> {
     key: K,
     seed: [u8; 32],
+    parameter: [u8; PARAMETER_LENGTH],
     path: PathBuf,
     _lock: File,
     next_leaf: u32,
-    last_digest: Option<[u8; 32]>,
+    last_message: Option<[u8; MESSAGE_LENGTH]>,
 }
 
 impl<K: OneTime> Drop for Signer<K> {
@@ -112,8 +115,14 @@ impl<K: OneTime> Drop for Signer<K> {
 }
 
 impl<K: OneTime> Signer<K> {
-    /// The seed must never have signed; the file is what to back up.
-    pub fn create(path: impl AsRef<Path>, seed: [u8; 32]) -> Result<Self, SignerError> {
+    /// `seed` and `parameter` are the caller's fresh randomness, Construction
+    /// 3's `sk` and `P`; the seed must never have signed. The file is what
+    /// to back up.
+    pub fn create(
+        path: impl AsRef<Path>,
+        seed: [u8; 32],
+        parameter: [u8; PARAMETER_LENGTH],
+    ) -> Result<Self, SignerError> {
         let path = path.as_ref().to_path_buf();
         let lock = lock(&path)?;
         let mut file = options()
@@ -125,12 +134,13 @@ impl<K: OneTime> Signer<K> {
                 _ => SignerError::Io(error),
             })?;
         let signer = Self {
-            key: K::from_seed(seed),
+            key: K::new(seed, parameter),
             seed,
+            parameter,
             path,
             _lock: lock,
             next_leaf: 0,
-            last_digest: None,
+            last_message: None,
         };
         file.write_all(&signer.record())?;
         file.sync_all()?;
@@ -153,22 +163,24 @@ impl<K: OneTime> Signer<K> {
             .as_slice()
             .try_into()
             .map_err(|_| SignerError::Corrupt)?;
-        let next_leaf = u32::from_le_bytes(record[NEXT_LEAF..HAS_DIGEST].try_into().unwrap());
+        let next_leaf = u32::from_be_bytes(record[NEXT_LEAF..HAS_MESSAGE].try_into().unwrap());
         if record[0] != VERSION
             || record[1] != K::HEIGHT
-            || record[HAS_DIGEST] > 1
+            || record[HAS_MESSAGE] > 1
             || next_leaf > K::LEAVES
         {
             return Err(SignerError::Corrupt);
         }
-        let seed: [u8; 32] = record[SEED..NEXT_LEAF].try_into().unwrap();
+        let seed: [u8; 32] = record[SEED..PARAMETER].try_into().unwrap();
+        let parameter: [u8; PARAMETER_LENGTH] = record[PARAMETER..NEXT_LEAF].try_into().unwrap();
         Ok(Self {
-            key: K::from_seed(seed),
+            key: K::new(seed, parameter),
             seed,
+            parameter,
             path,
             _lock: lock,
             next_leaf,
-            last_digest: (record[HAS_DIGEST] == 1).then(|| record[DIGEST..].try_into().unwrap()),
+            last_message: (record[HAS_MESSAGE] == 1).then(|| record[MESSAGE..].try_into().unwrap()),
         })
     }
 
@@ -201,9 +213,8 @@ impl<K: OneTime> Signer<K> {
 
     /// Record first, sign second (RFC 8391 §4.1.9); the last message is
     /// repeated, never re-spent.
-    pub fn sign(&mut self, message: &[u8]) -> Result<K::Signature, SignerError> {
-        let digest = sha256::hashv(&[message]);
-        if self.last_digest == Some(digest)
+    pub fn sign(&mut self, message: &[u8; MESSAGE_LENGTH]) -> Result<K::Signature, SignerError> {
+        if self.last_message.as_ref() == Some(message)
             && let Some(signature) = self.key.sign_at(self.next_leaf - 1, message)
         {
             return Ok(signature);
@@ -213,11 +224,11 @@ impl<K: OneTime> Signer<K> {
         }
         let leaf = self.next_leaf;
         self.next_leaf = leaf + 1;
-        self.last_digest = Some(digest);
+        self.last_message = Some(*message);
         if let Err(error) = self.write() {
-            // On disk or not, the leaf stays spent; the digest goes so the
+            // On disk or not, the leaf stays spent; the message goes so the
             // unrecorded signature can never be handed out.
-            self.last_digest = None;
+            self.last_message = None;
             return Err(error);
         }
         self.key
@@ -229,11 +240,12 @@ impl<K: OneTime> Signer<K> {
         let mut record = [0u8; RECORD];
         record[0] = VERSION;
         record[1] = K::HEIGHT;
-        record[SEED..NEXT_LEAF].copy_from_slice(&self.seed);
-        record[NEXT_LEAF..HAS_DIGEST].copy_from_slice(&self.next_leaf.to_le_bytes());
-        if let Some(digest) = &self.last_digest {
-            record[HAS_DIGEST] = 1;
-            record[DIGEST..].copy_from_slice(digest);
+        record[SEED..PARAMETER].copy_from_slice(&self.seed);
+        record[PARAMETER..NEXT_LEAF].copy_from_slice(&self.parameter);
+        record[NEXT_LEAF..HAS_MESSAGE].copy_from_slice(&self.next_leaf.to_be_bytes());
+        if let Some(message) = &self.last_message {
+            record[HAS_MESSAGE] = 1;
+            record[MESSAGE..].copy_from_slice(message);
         }
         record
     }

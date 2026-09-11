@@ -1,4 +1,4 @@
-//! Raw binding for `sol_sha256`. Only compiled for `target_os = "solana"`.
+//! Raw binding for `sol_keccak256`. Only compiled for `target_os = "solana"`.
 //!
 //! SBPF v3 toolchains set `target_feature = "static-syscalls"` and dispatch
 //! syscalls by the murmur3 hash of their name; older toolchains link the
@@ -11,7 +11,7 @@
     not(any(target_feature = "static-syscalls", feature = "static-syscalls"))
 ))]
 unsafe extern "C" {
-    pub fn sol_sha256(vals: *const u8, val_len: u64, hash_result: *mut u8) -> u64;
+    pub fn sol_keccak256(vals: *const u8, val_len: u64, hash_result: *mut u8) -> u64;
 }
 
 #[cfg(all(
@@ -19,12 +19,12 @@ unsafe extern "C" {
     any(target_feature = "static-syscalls", feature = "static-syscalls")
 ))]
 #[inline(always)]
-pub unsafe fn sol_sha256(vals: *const u8, val_len: u64, hash_result: *mut u8) -> u64 {
-    const ID: usize = sys_hash("sol_sha256");
+pub unsafe fn sol_keccak256(vals: *const u8, val_len: u64, hash_result: *mut u8) -> u64 {
+    const ID: usize = sys_hash("sol_keccak256");
     // SAFETY: on static-syscall targets the runtime binds each syscall to the
     // address equal to the murmur3 of its name, the convention
     // `solana-define-syscall` implements, and this signature is the runtime's
-    // `sol_sha256` ABI.
+    // `sol_keccak256` ABI.
     let f: extern "C" fn(*const u8, u64, *mut u8) -> u64 = unsafe { core::mem::transmute(ID) };
     f(vals, val_len, hash_result)
 }

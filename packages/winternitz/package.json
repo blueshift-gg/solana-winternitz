@@ -1,7 +1,7 @@
 {
   "name": "@blueshift-gg/solana-winternitz",
   "version": "0.1.0",
-  "description": "Post-quantum one-time signatures for Solana: target-sum Winternitz over SHA-256, byte-for-byte the solana-winternitz crate.",
+  "description": "Post-quantum hash-based signatures for Solana: DKKW25 generalized XMSS over Keccak-256, byte-for-byte the solana-winternitz crate.",
   "license": "MIT",
   "repository": "https://github.com/blueshift-gg/solana-winternitz",
   "type": "module",

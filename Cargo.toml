@@ -1,7 +1,7 @@
 [package]
 name = "solana-winternitz"
 authors = ["L0STE"]
-description = "Post-quantum one-time signatures for Solana programs: target-sum Winternitz over tweakable SHA-256, verified with the sol_sha256 syscall"
+description = "Post-quantum one-time signatures for Solana programs: DKKW25 generalized XMSS with target-sum Winternitz over Keccak-256, verified with the sol_keccak256 syscall"
 license = "MIT"
 version = "0.1.0"
 edition = "2024"
@@ -26,9 +26,9 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(target_feature, values("static-syscalls"))',
 ] }
 
-# Host SHA-256. Never compiled for the Solana target, where it is a syscall.
+# Host Keccak-256. Never compiled for the Solana target, where it is a syscall.
 [target.'cfg(not(target_os = "solana"))'.dependencies]
-sha2 = { version = "0.10", default-features = false }
+sha3 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 num-bigint = "0.4"
