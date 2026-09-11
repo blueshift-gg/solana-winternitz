@@ -14,7 +14,7 @@ test('the hash is Keccak-256, not SHA3-256', () => {
   expect(hex(keccak_256(new Uint8Array()))).toBe('c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470');
 });
 
-test.each(vectors.winternitz)('winternitz matches the Rust crate, case $#', ({ seed, parameter, message, public_key, signature }) => {
+test.each(vectors.winternitz)('winternitz matches the Rust crate', ({ seed, parameter, message, public_key, signature }) => {
   const key = winternitz.SecretKey.new(fromHex(seed), fromHex(parameter));
   expect(hex(key.publicKey.bytes)).toBe(public_key);
   expect(hex(key.signAt(0, fromHex(message)).bytes)).toBe(signature);
@@ -154,7 +154,7 @@ test('the signer owns leaf allocation', () => {
   expect(() => once.sign(m(6))).toThrow('exhausted');
   once.close();
   rmSync(dir, { recursive: true });
-});
+}, 60_000); // builds the 256-leaf key on every open
 
 test('the key file written by the Rust crate opens here', () => {
   const dir = mkdtempSync(join(tmpdir(), 'solana-winternitz-'));
