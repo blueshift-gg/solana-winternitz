@@ -33,7 +33,7 @@ paper's epoch.
 | leaf and node width | 256 | none in the paper | see §4.1 |
 
 Requirements are Parameter Requirements 2 and 3 of [DKKW25] at
-`k_C = 128`, `k_Q = 64`, evaluated by `tests/tests.rs` and equal to the
+`k_C = 128`, `k_Q = 64`, evaluated by `src/tests.rs` and equal to the
 output of [hashsig-parameters] for these inputs.
 
 ## 2. Model
@@ -218,8 +218,8 @@ steps per verification.
 |---|---|---:|---:|---|
 | second preimage of one signed encoding | one signature | `2^140` HMAC | `2^70` | generic, §3 |
 | herding across `t` signed leaves, plain SHA-256 | `t` signatures | `2^134.3` | ≥ `2^85` per merge | closed, §4.2 |
-| chain preimage or undetectability | one signature | ≥ `2^151`, eq. (15) with the `L·v·2^w` loss | ≥ `2^64`, eq. (15) | covered |
-| tree collision | one signature | ≥ `2^191`, eq. (6) at `|P| = 2^192` | ≥ `2^93` | covered |
+| chain preimage or undetectability | one signature | `2^192` per target, `2^171` after the proof's `L·v·2^(2w)` loss; eq. (15) requires `2^151.5` | `2^71` in the `β` term of §3 | covered |
+| tree collision | one signature | `2^191`, the `2q/|P|` term of Table 1 | `2^123`, the `32q²/|P|` term | covered |
 | seed recovery from `P` | public key | `2^192` constrained preimages, wrong root with overwhelming probability | | covered |
 | leaf reuse, `k` signatures under one leaf | violation of A1 | table below | | outside the model |
 | multi-user forgery against `U` keys | `U` public keys | single-key cost `/ U` at most | | §7 |
@@ -294,7 +294,7 @@ crate enforces it and what §5 says about its violation.
 ## 8. Verification record
 
 Mechanically checked in the repository: eqs. (13) to (16) and `η_T`
-(`tests/tests.rs`); HMAC against [RFC4231]; the vector corpus reproduced
+(`src/tests.rs`); HMAC against [RFC4231]; the vector corpus reproduced
 by two implementations sharing no code; the SBPF verifier under Mollusk
 against host-generated signatures, 29 524 and 31 224 CU. Reproduced in
 this analysis: the herding structure of §4.2 at reduced parameters and
