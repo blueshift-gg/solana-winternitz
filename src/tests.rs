@@ -3,7 +3,8 @@
 //! key, public key and signatures of the authors' implementation reproduced
 //! byte for byte, both instances against `tests/vectors.json` and the
 //! key-file fixture, every single-byte tamper rejected, garbage rejected
-//! without panics, and the signer's allocation rules.
+//! without panics, the signer's allocation rules, and its kernel lock
+//! dying with its holder.
 use num_bigint::BigUint;
 use serde_json::Value;
 use std::vec::Vec;
@@ -356,6 +357,11 @@ fn signer_owns_leaf_allocation() {
     assert!(lock.exists());
     let record = std::fs::read(&path).unwrap();
     std::fs::write(&path, &record[..record.len() - 1]).unwrap();
+    assert!(matches!(Tree::open(&path), Err(SignerError::Corrupt)));
+    // A message flag with no spent leaf contradicts itself.
+    let mut contradiction = record.clone();
+    contradiction[NEXT_LEAF..NEXT_LEAF + 4].copy_from_slice(&0u32.to_be_bytes());
+    std::fs::write(&path, &contradiction).unwrap();
     assert!(matches!(Tree::open(&path), Err(SignerError::Corrupt)));
 
     // Last leaf: one more message, then only that one.

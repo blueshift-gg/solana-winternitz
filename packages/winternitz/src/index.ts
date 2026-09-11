@@ -268,7 +268,7 @@ export namespace xmss {
     }
   }
 
-  /** Construction 3 Gen with hash-sig's PRF, every node kept: ~140k hashes to build. */
+  /** Construction 3 Gen with hash-sig's PRF, every node kept: ~148k hashes to build. */
   export class SecretKey {
     readonly #seed: Uint8Array;
     readonly #parameter: Uint8Array;
@@ -399,7 +399,7 @@ export class Signer<S> {
       const parameter = Uint8Array.from(record.subarray(PARAMETER, NEXT_LEAF));
       const key = type.new(seed, parameter);
       const nextLeaf = record.readUInt32BE(NEXT_LEAF);
-      if (record[1] !== key.height || nextLeaf > key.leaves) throw corrupt;
+      if (record[1] !== key.height || nextLeaf > key.leaves || (record[HAS_MESSAGE] === 1 && nextLeaf === 0)) throw corrupt;
       const lastMessage = record[HAS_MESSAGE] === 1 ? Uint8Array.from(record.subarray(MESSAGE, RECORD)) : undefined;
       return new Signer(key, seed, parameter, path, lock, nextLeaf, lastMessage);
     } catch (error) {

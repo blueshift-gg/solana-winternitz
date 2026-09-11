@@ -38,7 +38,8 @@ pub enum SignerError {
     Missing,
     /// Another signer holds the file.
     Locked,
-    /// Wrong length, version or instance height.
+    /// Wrong length, version or instance height, or a record that
+    /// contradicts itself.
     Corrupt,
     /// The record is behind the chain: a restored old copy.
     BelowFloor {
@@ -167,6 +168,7 @@ impl<K: OneTime> Signer<K> {
         if record[0] != VERSION
             || record[1] != K::HEIGHT
             || record[HAS_MESSAGE] > 1
+            || (record[HAS_MESSAGE] == 1 && next_leaf == 0)
             || next_leaf > K::LEAVES
         {
             return Err(SignerError::Corrupt);

@@ -1,7 +1,7 @@
 //! Keccak-256: the `sol_keccak256` syscall on-chain, the `sha3` crate on the
-//! host. The paper instantiates with SHA-3 (§7.2); Keccak-256 is the same
-//! permutation, rate and capacity with a different padding byte, and the
-//! sponge instantiation Solana provides. On-chain cost (agave
+//! host. The paper instantiates with SHA3-256 (§7.2); Keccak-256 is the
+//! same permutation, rate and capacity with a different padding suffix,
+//! and the sponge Solana provides (SECURITY.md §4.1). On-chain cost (agave
 //! `execution_budget.rs`, `syscalls/src/lib.rs`): 85 CU per call plus, per
 //! slice, `max(10, len / 2)` CU, the same for every hash syscall.
 

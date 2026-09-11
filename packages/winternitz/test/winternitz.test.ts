@@ -117,16 +117,20 @@ test('the signer owns leaf allocation', () => {
   expect(() => Signer.open(xmss.SecretKey, path).floor(4)).toThrow('behind the chain');
   Signer.open(xmss.SecretKey, path).floor(3).close();
 
-  // Interrupted write: stale temp ignored, truncated record refused.
+  // A stale temp file is ignored, and the sidecar's content is not the lock.
   writeFileSync(`${path}.tmp`, 'garbage');
-  // The lock is the kernel's, not the sidecar's existence or content.
   writeFileSync(`${path}.lock`, 'anything');
   const after = Signer.open(xmss.SecretKey, path);
   expect(after.nextLeaf).toBe(3);
   after.close();
   expect(existsSync(`${path}.lock`)).toBe(true);
+  // A truncated record and a self-contradicting one are refused.
   const record = readFileSync(path);
   writeFileSync(path, record.subarray(0, record.length - 1));
+  expect(() => Signer.open(xmss.SecretKey, path)).toThrow('not a record of this instance');
+  const contradiction = Buffer.from(record);
+  contradiction.writeUInt32BE(0, 2 + 32 + PARAMETER_LENGTH);
+  writeFileSync(path, contradiction);
   expect(() => Signer.open(xmss.SecretKey, path)).toThrow('not a record of this instance');
 
   // Last leaf: one more message, then only that one.

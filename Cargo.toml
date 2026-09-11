@@ -1,7 +1,7 @@
 [package]
 name = "solana-winternitz"
 authors = ["L0STE"]
-description = "Post-quantum one-time signatures for Solana programs: DKKW25 generalized XMSS with target-sum Winternitz over Keccak-256, verified with the sol_keccak256 syscall"
+description = "Post-quantum hash-based signatures for Solana programs: DKKW25 generalized XMSS over target-sum Winternitz with Keccak-256, verified with the sol_keccak256 syscall"
 license = "MIT"
 version = "0.1.0"
 edition = "2024"
@@ -14,7 +14,7 @@ include = ["/src", "/tests", "/LICENSE", "/README.md", "/SPEC.md", "/SECURITY.md
 default = []
 # Host-only key generation and signing (never compiled for `target_os =
 # "solana"`: signing on-chain reveals the secret key).
-sign = []
+sign = ["dep:getrandom"]
 # Use the SBPF v3 static-syscall ABI (murmur3-hashed name → fn pointer) even
 # on toolchains that support it but do not advertise `target_feature =
 # "static-syscalls"`.
@@ -29,8 +29,10 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # Host Keccak-256. Never compiled for the Solana target, where it is a syscall.
 [target.'cfg(not(target_os = "solana"))'.dependencies]
 sha3 = { version = "0.10", default-features = false }
+getrandom = { version = "0.3", optional = true }
 
 [dev-dependencies]
+getrandom = "0.3"
 num-bigint = "0.4"
 serde_json = "1"
 svm-unit-test = "0.1.10"
