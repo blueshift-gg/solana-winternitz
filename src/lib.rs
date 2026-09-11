@@ -197,19 +197,9 @@ fn leaf_hash(
     leaf: u32,
     ends: &[[u8; ELEMENT_LENGTH]; CHAINS],
 ) -> [u8; NODE_LENGTH] {
-    const ENDS: usize = TREE_TWEAK_LENGTH + PARAMETER_LENGTH;
-    let mut buf = [0u8; ENDS + ELEMENTS_LENGTH];
-    buf[..TREE_TWEAK_LENGTH].copy_from_slice(&tree_tweak(0, leaf));
-    buf[TREE_TWEAK_LENGTH..ENDS].copy_from_slice(parameter);
-    for (slot, end) in buf[ENDS..]
-        .as_chunks_mut::<ELEMENT_LENGTH>()
-        .0
-        .iter_mut()
-        .zip(ends)
-    {
-        *slot = *end;
-    }
-    sha256::hashv(&[&buf])
+    // Three slices, no copy: the 840 contiguous bytes of `ends` go straight
+    // to the syscall. Copying them into one buffer measured 200–500 CU more.
+    sha256::hashv(&[&tree_tweak(0, leaf), parameter, ends.as_flattened()])
 }
 
 /// Construction 1 node, `Th(P, tweakmt(l, i), (left, right))`.

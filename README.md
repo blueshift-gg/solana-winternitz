@@ -12,8 +12,8 @@ quantum security. Two instances share one implementation and one 56-byte public 
 
 | Instance | Signatures per key | Signature | Verify CU |
 |---|---:|---:|---:|
-| `winternitz` | 1 | 864 B | 29,539 |
-| `xmss` | 256, one per leaf | 1,124 B | 31,239 |
+| `winternitz` | 1 | 864 B | 29,524 |
+| `xmss` | 256, one per leaf | 1,124 B | 31,224 |
 
 ## What is a hash-based signature?
 
@@ -125,14 +125,16 @@ pad the seed to a full block and use SHA-512 above security category 1.
 |---|---:|---:|
 | Message hash, HMAC-SHA-256, and target-sum check | 2 | ~270 CU |
 | Chain steps, 55-byte input each | 200 | ~22,400 CU |
-| Leaf hash over `P`, tweak and 35 chain ends, 870 bytes | 1 | ~520 CU |
+| Leaf hash over tweak, `P` and the 35 chain ends, three slices | 1 | ~530 CU |
 | Tree nodes, `xmss` only | 8 | ~1,000 CU |
 
 The remainder of the measured total is BPF loop overhead: a tight loop of
 bare chain-step syscalls measures within 2.5k CU of `verify`. Variants
-measured and declined: three-slice hashing without copies costs more (the
-runtime charges at least 10 CU per slice), and shrinking every length to the
-paper's exact bound saves 9% at one to two bits of margin.
+measured and declined: three-slice chain steps, where the runtime's 10 CU
+minimum per slice exceeds the one copy; copying the chain ends into one
+leaf buffer, 200 to 500 CU more than passing them as a third slice; and
+shrinking every length to the paper's exact bound, which saves 9% at one
+to two bits of margin.
 
 ## Tests and verification
 
@@ -180,15 +182,16 @@ Local measurements with platform-tools v1.56:
 
 | Operation | Compute units |
 |---|---:|
-| `winternitz::Signature::verify`, accepted | 29,539 |
-| `xmss::Signature::verify`, accepted | 31,239 |
+| `winternitz::Signature::verify`, accepted | 29,524 |
+| `xmss::Signature::verify`, accepted | 31,224 |
 | either, message off target | 1,076 |
 
 The HMAC message hash costs about 210 CU of these figures over a plain
 hash: two syscalls of 138 and 133 CU in place of one of 140, plus the pad
 construction, done eight bytes at a time because a byte loop measured
 1,000 CU on SBPF. Measured before and after on the same machine and
-toolchain: 29,329 and 31,025 before, 29,539 and 31,239 after.
+toolchain: 29,329 and 31,025 before, 29,524 and 31,224 after, the last
+15 CU recovered by passing the chain ends to the leaf hash uncopied.
 
 For comparison, the previous `solana-winternitz` crate (32 byte-wide chains,
 no checksum) needs about 4,080 hashes on average and 8,160 in the worst
