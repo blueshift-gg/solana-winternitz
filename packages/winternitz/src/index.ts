@@ -213,8 +213,9 @@ export namespace winternitz {
     readonly leaves = 1;
     readonly height = HEIGHT;
 
-    /** Construction 3 Sig at the one leaf. Records nothing. */
-    signAt(_leaf: number, message: Uint8Array): Signature {
+    /** Construction 3 Sig at the one leaf; throws at any other. Records nothing. */
+    signAt(leaf: number, message: Uint8Array): Signature {
+      if (leaf !== 0) throw new RangeError('leaf: expected 0');
       return Signature.from(signLeaf(this.#seed, this.#parameter, 0, bytes(message, MESSAGE_LENGTH, 'message')));
     }
   }
@@ -479,29 +480,51 @@ export class Signer<S> {
 }
 
 /**
- * Node has no file locking, so the lock is an exclusively created `.lock` sidecar holding the pid; a sidecar
- * because rename would orphan a lock on the record. Cleared when its pid is gone, fatal when alive or reused.
+ * The `.lock` sidecar, created exclusively and holding the owner's pid: the Rust crate's protocol byte for
+ * byte, so each refuses a file the other holds. A sidecar because rename would orphan a lock on the record.
+ * An empty or unreadable lock is held, its owner between creating it and writing its pid. A dead owner's
+ * lock is renamed away before removal, so of two openers clearing it at once only one can go on to create.
  */
 function acquire(path: string): string {
   const lock = `${path}.lock`;
+  const locked = new Error(`the key file is locked (${lock})`);
   for (let attempt = 0; attempt < 2; attempt++) {
+    let fd: number;
     try {
-      const fd = openSync(lock, 'wx', 0o600);
-      writeSync(fd, String(process.pid));
-      closeSync(fd);
-      return lock;
+      fd = openSync(lock, 'wx', 0o600);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      let owner: string;
+      try {
+        owner = readFileSync(lock, 'utf8');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+      const pid = Number(owner.trim());
+      if (!Number.isInteger(pid) || pid <= 0 || alive(pid)) throw locked;
+      try {
+        renameSync(lock, `${lock}.stale`);
+        unlinkSync(`${lock}.stale`);
+      } catch {
+        // Another opener cleared it first.
+      }
+      continue;
     }
-    const pid = Number(readFileSync(lock, 'utf8'));
-    if (alive(pid)) throw new Error(`the key file is locked by process ${pid} (${lock})`);
-    unlinkSync(lock);
+    try {
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
+    } catch (error) {
+      release(lock);
+      throw error;
+    }
+    return lock;
   }
-  throw new Error(`could not lock ${lock}`);
+  throw locked;
 }
 
+/** `kill(pid, 0)` delivers nothing and reports whether the process exists; `EPERM` means it exists under another user. */
 function alive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;

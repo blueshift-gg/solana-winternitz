@@ -172,6 +172,7 @@ fn winternitz_roundtrip() {
         assert_eq!(sig.verify(&pk, m), Ok(()));
         let other = winternitz::SecretKey::new(seed(9), parameter(9)).public_key();
         assert_eq!(sig.verify(&other, m), Err(Error::InvalidSignature));
+        assert!(sk.sign_at(1, m).is_none());
         assert_eq!(
             sig.verify(&pk, &message(b"other")),
             Err(Error::InvalidSignature)
@@ -290,7 +291,9 @@ const NEXT_LEAF: usize = 2 + 32 + PARAMETER_LENGTH;
 
 /// The signer's rules: one instance per file, no open without a file, the
 /// last message repeated for free, and foreign, truncated, behind-the-chain
-/// and exhausted files all refused.
+/// and exhausted files all refused; the lock protocol shared with the
+/// TypeScript package: a live or unreadable owner refuses, a dead one is
+/// cleared.
 #[test]
 fn signer_owns_leaf_allocation() {
     use crate::{Signer, SignerError};
@@ -347,6 +350,21 @@ fn signer_owns_leaf_allocation() {
     // Interrupted write: stale temp ignored, truncated record refused.
     std::fs::write(dir.join("tree.key.tmp"), b"garbage").unwrap();
     assert_eq!(Tree::open(&path).unwrap().next_leaf(), 3);
+
+    // The lock file: a live pid, an empty file and garbage all refuse; a
+    // dead pid is cleared; a released lock is gone.
+    let lock = dir.join("tree.key.lock");
+    let pid = std::format!("{}", std::process::id());
+    for owner in [pid.as_str(), "", "abc"] {
+        std::fs::write(&lock, owner).unwrap();
+        assert!(matches!(Tree::open(&path), Err(SignerError::Locked)));
+        std::fs::remove_file(&lock).unwrap();
+    }
+    std::fs::write(&lock, "999999999").unwrap();
+    let held = Tree::open(&path).unwrap();
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), pid);
+    drop(held);
+    assert!(!lock.exists());
     let record = std::fs::read(&path).unwrap();
     std::fs::write(&path, &record[..record.len() - 1]).unwrap();
     assert!(matches!(Tree::open(&path), Err(SignerError::Corrupt)));

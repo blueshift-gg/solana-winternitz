@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import vectors from '../../../tests/vectors.json' with { type: 'json' };
 import reference from '../../../tests/hash-sig.json' with { type: 'json' };
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MESSAGE_LENGTH, PARAMETER_LENGTH, PUBLIC_KEY_LENGTH, PublicKey, Signer, winternitz, xmss } from '../src/index.js';
@@ -115,12 +115,20 @@ test('the signer owns leaf allocation', () => {
   expect(() => Signer.open(xmss.SecretKey, path).floor(4)).toThrow('behind the chain');
   Signer.open(xmss.SecretKey, path).floor(3).close();
 
-  // Interrupted write: stale temp ignored, truncated record refused, dead pid's lock cleared.
+  // Interrupted write: stale temp ignored, truncated record refused.
   writeFileSync(`${path}.tmp`, 'garbage');
+  // The lock file: a live pid, an empty file and garbage all refuse; a dead pid is cleared; close removes it.
+  for (const owner of [String(process.pid), '', 'abc']) {
+    writeFileSync(`${path}.lock`, owner);
+    expect(() => Signer.open(xmss.SecretKey, path)).toThrow('locked');
+    rmSync(`${path}.lock`);
+  }
   writeFileSync(`${path}.lock`, '999999999');
   const after = Signer.open(xmss.SecretKey, path);
   expect(after.nextLeaf).toBe(3);
+  expect(readFileSync(`${path}.lock`, 'utf8')).toBe(String(process.pid));
   after.close();
+  expect(existsSync(`${path}.lock`)).toBe(false);
   const record = readFileSync(path);
   writeFileSync(path, record.subarray(0, record.length - 1));
   expect(() => Signer.open(xmss.SecretKey, path)).toThrow('not a record of this instance');
@@ -166,6 +174,7 @@ test('inputs are range-checked', () => {
   const m = new Uint8Array(MESSAGE_LENGTH);
   expect(() => xmss.SecretKey.new(new Uint8Array(32), p).signAt(xmss.LEAVES, m)).toThrow('leaf');
   expect(() => winternitz.SecretKey.new(new Uint8Array(32), p).signAt(0, new Uint8Array(31))).toThrow('expected 32 bytes');
+  expect(() => winternitz.SecretKey.new(new Uint8Array(32), p).signAt(1, m)).toThrow('leaf');
   expect(() => winternitz.Signature.from(new Uint8Array(849)).verify(PublicKey.from(new Uint8Array(41)), new Uint8Array(33))).toThrow('expected 32 bytes');
   expect(() => winternitz.SecretKey.new(new Uint8Array(31), p)).toThrow('expected 32 bytes');
   expect(() => winternitz.SecretKey.new(new Uint8Array(32), new Uint8Array(17))).toThrow('expected 18 bytes');

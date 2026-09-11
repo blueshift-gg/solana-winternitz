@@ -58,8 +58,10 @@ The adversary receives `pk = (root, P)`, may query `Sig(ℓ, m)` at most
 once per leaf `ℓ`, and wins with `(ℓ*, m*, σ*)` such that `Ver` accepts
 and `(m*, σ*)` is not the pair returned for `ℓ*`. Queries to the hash are
 counted as `q`, classical or quantum; signing queries are classical and
-number `q_s ≤ L`. The paper's convention charges the signing oracle's own
-hashing to the adversary's time `t`, so `t ≥ q + q_s K`.
+number `q_s ≤ L`. Theorem 5 charges the reduction `q' = q + pK` hash
+queries, `K` per signing query whether or not the signer's grinding stops
+early; the figures of §3 divide by this charged `t ≥ q + q_s K`, an
+accounting convention, not measured work.
 
 Outside the model, and treated in §6: replay of a valid signature, which
 the definition does not count as a forgery; more than one signature per
@@ -92,10 +94,10 @@ Substituting the random-oracle bounds of [DKKW25, Table 1] with
 query count by `t`:
 
 ```
-classical:  Adv/t ≤ 1/2^144 + 6/2^144 + pK/2^168 + (6 + a_L·(2^w + 2))/2^184
-                  ≤ 2^-144 + 2^-141.4 + 2^-148 + 2^-162.7  ≈ 2^-141.2
+classical:  (Adv − Δ_PRF)/t ≤ 1/2^144 + 6/2^144 + pK/2^168 + (6 + a_L·(2^w + 2))/2^184
+                            ≤ 2^-144 + 2^-141.4 + 2^-148 + 2^-162.7  ≈ 2^-141.2
 
-quantum:    Adv   ≤ α·t² + β·t + γ·√t,
+quantum:    Adv − Δ_PRF ≤ α·t² + β·t + γ·√t,
             α = 8/2^144 + 96/2^144 + (96 + 8·a_L)/2^184 ≈ 2^-137.3,
             β = 12·a_L·(2^w + 1)/2^92 ≈ 2^-67.2,
             γ = (3/2)·pK/2^84 ≈ 2^-63.4,
@@ -108,7 +110,8 @@ the collision bounds, one for `T₁` and two for `T₃`: the classical level,
 bits as eqs. (13) and (16) require. The quantum level is the 64-bit
 target, with 67 bits in the regime where the bound is not trivial; the
 `γ` term is why `t` is taken at or above `pK`, the signing oracle's own
-hashing. `Δ_PRF` is not quantified; §4.2 states what it assumes. The
+hashing. `Δ_PRF` is not quantified and stays on the left of both
+inequalities; §4.2 states what it assumes. The
 application's hash of its payload into the 32-byte message is outside
 the bound: a chosen-message collision on it costs `2^128` classically and
 about `2^85` quantumly, at and above the targets, and is A4's concern.
@@ -119,24 +122,44 @@ and Table 1 estimates them by modelling the hash as a random oracle.
 
 ## 4. Departures from the paper and hash-sig
 
+What is not the paper's or hash-sig's, each treated below or in §6: the
+hash function (§4.1); salts from the PRF where the paper samples them, as
+hash-sig does (§4.2); lifetimes `2^0` and `2^8` with lengths recomputed
+from the authors' script, where hash-sig ships `2^18` and up; `K = 4096`,
+§8's parameter-setting assumption, where hash-sig allows 100 000 and
+produces the same salts up to there; the wire formats, which carry the
+epoch inside the signature, and the signer's key file (§6). Parameter
+Requirement 3 is stated for `L, v ≥ 2`; the `winternitz` instance at
+`L = 1` uses the `L = 2^8` widths, which meet every requirement at `L = 1`
+since each bound is non-decreasing in `log L`.
+
 ### 4.1 Keccak-256 for SHA3-256
 
-**Claim.** Every argument the paper makes for its SHA-3 instantiation
-applies unchanged to Keccak-256.
+**Claim.** This is a Keccak-256 instantiation of the paper's generic
+construction. The reduction of Theorem 1 applies under the properties of
+§3 assumed for these Keccak-256 functions and for `Φ_seed`. Matching
+sponge parameters and related padding support analogous security
+estimates; they do not prove equal concrete classical or quantum security
+to SHA3-256, and the paper proves nothing about the concrete SHA3-256
+functions either.
 
-**Argument.** SHA3-256 [FIPS202] is `Keccak[c = 512]` with the two-bit
-suffix `01` appended to the message before the `pad10*1` padding;
-Keccak-256 as deployed in Ethereum and provided by Solana's
-`sol_keccak256` syscall is `Keccak[c = 512]` with `pad10*1` alone. The
-permutation `Keccak-p[1600, 24]`, the rate of 1088 bits, the capacity of
-512 bits and the 256-bit output are identical; the suffix exists to
-separate SHA3-256 from SHAKE and the other FIPS 202 functions, which are
-not used here. The sponge indifferentiability result of [BDPV08] holds
-for any sponge-compliant padding, of which both are instances, with the
-same loss `O(σ²/2^512)` in the number of permutation calls; the
-cryptanalytic record of §7.2.3 concerns the permutation and the
-capacity, not the suffix. No reduction in the paper, and none in this
-document, depends on the padding.
+**What is the same.** SHA3-256 [FIPS202] is `Keccak[c = 512](M ‖ 01)`;
+Keccak-256, Ethereum's and Solana's `sol_keccak256`, is
+`Keccak[c = 512](M)`, both under `pad10*1`. The permutation
+`Keccak-p[1600, 24]`, the 1088-bit rate, the 512-bit capacity and the
+256-bit output are identical; the suffix separates SHA3-256 from SHAKE,
+which is not used here. In the classical ideal-permutation model both
+are sponges with an admissible padding, and [BDPV08, Theorem 2] gives
+each the same indifferentiability loss `O(N²/2^512)` in permutation
+calls `N`. That model replaces the fixed permutation by a random one and
+says nothing about concrete security, and its bound does not carry to
+quantum queries: the quantum ideal-permutation result of [ACMT25,
+Theorem 7.22] is vacuous at this rate and capacity for `q = 2^64`, so the
+quantum figures of §3 rest on the QROM heuristic of Table 1 applied to
+Keccak-256, as the paper applies it to SHA3-256. The cryptanalytic record
+of §7.2.3 concerns the permutation and capacity and reads the same for
+both; the designers' argument that the suffix restricts Keccak's domain
+supports the suffixed function from the plain one, not the converse.
 
 **Why not SHA3-256 itself.** Solana has no SHA3-256 syscall. SHA3-256 in
 software on the SBPF target measures about 11,600 CU per call, and one
@@ -228,8 +251,11 @@ crate enforces it and what §5 says about its violation.
 - **A1, one message per leaf.** Enforced by `Signer`: a leaf is recorded
   as spent before its signature is released, the last message is
   repeated rather than re-signed, a different message on a spent leaf is
-  refused. `sign_at` bypasses this and is for tests. Violation: leaf
-  reuse, §5.
+  refused, and one process holds a key file at a time through a `.lock`
+  sidecar carrying its pid, the same protocol in both packages, so a file
+  held by one implementation is refused by the other. Pid files assume
+  one pid namespace: signers of one file share a host. `sign_at` bypasses
+  all of this and is for tests. Violation: leaf reuse, §5.
 - **A2, integrity of the signer's record.** The record holds the seed,
   `P`, the next leaf and the last message; a copy older than the latest
   signature reintroduces A1's violation. Not detectable
@@ -279,8 +305,11 @@ swapped to Keccak-256, at these exact type parameters, whose public key
 and five signatures both packages reproduce byte for byte from its PRF
 key and parameter (`tests/hash-sig.json`); the vector corpus reproduced
 by two implementations sharing no code; the SBPF verifier under Mollusk
-against host-generated signatures, 34 331 and 35 971 CU. Reproduced in
-this analysis: the leaf-reuse forgeries of §5 at full parameters,
+against host-generated signatures, 34 331 and 35 971 CU; the lock
+protocol against a live pid, an empty file, garbage and a dead pid in
+both packages. Checked outside CI through the public APIs: each package
+refuses a key file the other holds, in both acquisition orders, and
+opens it once released. Reproduced in this analysis: the leaf-reuse forgeries of §5 at full parameters,
 accepted by the verifier; software SHA3-256 on the SBPF target exhausting
 1 400 000 CU in one verification, 12 454 CU for the single message hash
 of a rejected signature.
@@ -319,6 +348,8 @@ accepted leaf: rejected, a guess (A2).
   Functions. NIST, 2015.
 - [BDPV08] G. Bertoni, J. Daemen, M. Peeters, G. Van Assche. On the
   Indifferentiability of the Sponge Construction. EUROCRYPT 2008.
+- [ACMT25] G. Alagic, J. Carolan, C. Majenz, S. Tokat. The Sponge is
+  Quantum Indifferentiable. arXiv:2504.16887, 2025.
 - [PKC22] R. Perlner, J. Kelsey, D. Cooper. Breaking Category Five
   SPHINCS+ with SHA-256. PQCrypto 2022. https://eprint.iacr.org/2022/1061
 - [KK06] J. Kelsey, T. Kohno. Herding Hash Functions and the Nostradamus

@@ -109,9 +109,12 @@ Construction 3 Ver, constant work for an accepted signature:
 | key file | `version(1) = 1 ‖ h(1) ‖ seed(32) ‖ P(18) ‖ next leaf(4) ‖ message flag(1) ‖ last message(32)` | 89 |
 
 The key file is written with mode 0600 and replaced atomically: temp
-file, fsync, rename, directory fsync. A `.lock` sidecar next to it is held
-by the open signer, through the OS file lock in Rust and an exclusively
-created file holding the pid in Node. The last message signed is stored
+file, fsync, rename, directory fsync. A `.lock` sidecar next to it holds
+the open signer's pid and is created exclusively, the same protocol in
+both packages: a live or unreadable owner refuses, a dead owner's lock is
+renamed away and removed, so that of two openers clearing it at once only
+one can go on to create. It assumes one pid namespace. The last message
+signed is stored
 whole, flag 0 before the first signature. `h` tags the instance so a file
 opens only under its own; it enters no derivation.
 

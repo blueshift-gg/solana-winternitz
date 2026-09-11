@@ -77,8 +77,12 @@ impl crate::OneTime for SecretKey {
         SecretKey::public_key(self)
     }
 
-    /// Construction 3 Sig at the one leaf. Records nothing.
-    fn sign_at(&self, _leaf: u32, message: &[u8; MESSAGE_LENGTH]) -> Option<Signature> {
+    /// Construction 3 Sig at the one leaf; `None` at any other. Records
+    /// nothing.
+    fn sign_at(&self, leaf: u32, message: &[u8; MESSAGE_LENGTH]) -> Option<Signature> {
+        if leaf != 0 {
+            return None;
+        }
         let (salt, elements) = crate::seed::sign(&self.seed, &self.parameter, 0, message)?;
         let mut sig = Signature([0; SIGNATURE_LENGTH]);
         sig.0[..SALT_LENGTH].copy_from_slice(&salt);
