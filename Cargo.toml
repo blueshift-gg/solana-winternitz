@@ -6,7 +6,6 @@ license = "MIT"
 version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/blueshift-gg/solana-winternitz"
-readme = "README.md"
 keywords = ["solana", "winternitz", "post-quantum", "hash-based", "no-std"]
 categories = ["cryptography", "no-std"]
 include = ["/src", "/tests", "/LICENSE", "/README.md"]

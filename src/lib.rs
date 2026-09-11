@@ -107,13 +107,15 @@ fn hmac(key: &[u8], message: &[u8]) -> [u8; sha256::HASH_LENGTH] {
     let mut ipad = [0u8; 64];
     let mut opad = [0u8; 64];
     for ((k, i), o) in padded
-        .chunks_exact(8)
-        .zip(ipad.chunks_exact_mut(8))
-        .zip(opad.chunks_exact_mut(8))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(ipad.as_chunks_mut::<8>().0.iter_mut())
+        .zip(opad.as_chunks_mut::<8>().0.iter_mut())
     {
-        let k = u64::from_ne_bytes(k.try_into().unwrap());
-        i.copy_from_slice(&(k ^ 0x3636_3636_3636_3636).to_ne_bytes());
-        o.copy_from_slice(&(k ^ 0x5c5c_5c5c_5c5c_5c5c).to_ne_bytes());
+        let k = u64::from_ne_bytes(*k);
+        *i = (k ^ 0x3636_3636_3636_3636).to_ne_bytes();
+        *o = (k ^ 0x5c5c_5c5c_5c5c_5c5c).to_ne_bytes();
     }
     let inner = sha256::hashv(&[&ipad, message]);
     sha256::hashv(&[&opad, &inner])
@@ -172,10 +174,10 @@ impl Chain {
         let mut ends = [[0u8; ELEMENT_LENGTH]; CHAINS];
         for (i, (end, element)) in ends
             .iter_mut()
-            .zip(elements.chunks_exact(ELEMENT_LENGTH))
+            .zip(elements.as_chunks::<ELEMENT_LENGTH>().0)
             .enumerate()
         {
-            *end = self.walk(i as u8, x[i], POSITIONS - 1, element.try_into().unwrap());
+            *end = self.walk(i as u8, x[i], POSITIONS - 1, element);
         }
         ends
     }
@@ -199,8 +201,13 @@ fn leaf_hash(
     let mut buf = [0u8; ENDS + ELEMENTS_LENGTH];
     buf[..TREE_TWEAK_LENGTH].copy_from_slice(&tree_tweak(0, leaf));
     buf[TREE_TWEAK_LENGTH..ENDS].copy_from_slice(parameter);
-    for (slot, end) in buf[ENDS..].chunks_exact_mut(ELEMENT_LENGTH).zip(ends) {
-        slot.copy_from_slice(end);
+    for (slot, end) in buf[ENDS..]
+        .as_chunks_mut::<ELEMENT_LENGTH>()
+        .0
+        .iter_mut()
+        .zip(ends)
+    {
+        *slot = *end;
     }
     sha256::hashv(&[&buf])
 }
@@ -285,16 +292,13 @@ mod seed {
             let x = encode(&salt, parameter, leaf, message)?;
             let mut elements = [0u8; ELEMENTS_LENGTH];
             for (i, (slot, &xi)) in elements
-                .chunks_exact_mut(ELEMENT_LENGTH)
+                .as_chunks_mut::<ELEMENT_LENGTH>()
+                .0
+                .iter_mut()
                 .zip(&x)
                 .enumerate()
             {
-                slot.copy_from_slice(&chain.walk(
-                    i as u8,
-                    0,
-                    xi,
-                    &start(seed, height, leaf, i as u8),
-                ));
+                *slot = chain.walk(i as u8, 0, xi, &start(seed, height, leaf, i as u8));
             }
             Some((salt, elements))
         })

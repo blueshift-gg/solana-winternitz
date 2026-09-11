@@ -39,7 +39,8 @@ impl Signature {
             .ok_or(Error::InvalidSignature)?;
         let ends = Chain::new(parameter, leaf).ends(&x, &self.0[ELEMENTS..PATH]);
         let mut current = leaf_hash(parameter, leaf, &ends);
-        for (level, sibling) in (1..=HEIGHT as u8).zip(self.0[PATH..].chunks_exact(NODE_LENGTH)) {
+        for (level, sibling) in (1..=HEIGHT as u8).zip(self.0[PATH..].as_chunks::<NODE_LENGTH>().0)
+        {
             let index = leaf >> level;
             current = if (leaf >> (level - 1)) & 1 == 0 {
                 node(parameter, level, index, &current, sibling)
@@ -131,9 +132,14 @@ impl crate::OneTime for SecretKey {
         sig.0[..SALT].copy_from_slice(&leaf.to_le_bytes());
         sig.0[SALT..ELEMENTS].copy_from_slice(&salt);
         sig.0[ELEMENTS..PATH].copy_from_slice(&elements);
-        for (l, slot) in sig.0[PATH..].chunks_exact_mut(NODE_LENGTH).enumerate() {
+        for (l, slot) in sig.0[PATH..]
+            .as_chunks_mut::<NODE_LENGTH>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
             let sibling = ((leaf as usize) >> l) ^ 1;
-            slot.copy_from_slice(&self.nodes[Self::level(l) + sibling]);
+            *slot = self.nodes[Self::level(l) + sibling];
         }
         Some(sig)
     }
