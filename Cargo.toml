@@ -32,4 +32,15 @@ getrandom = { version = "0.3", optional = true }
 getrandom = "0.3"
 num-bigint = "0.4"
 serde_json = "1"
-svm-unit-test = "0.1.10"
+mollusk-svm = "0.15.1"
+solana-address = "2.6.1"
+solana-instruction = "3.4.1"
+
+[workspace]
+members = ["program"]
+default-members = ["."]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3

@@ -27,7 +27,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly clippy --all-targets --features sign -- -D warnings
+      - run: cargo +nightly clippy --workspace --all-targets --features sign -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -45,6 +45,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install --locked cargo-build-sbf --version 4.2.0
+      - run: cargo build-sbf --arch v3 --manifest-path program/Cargo.toml
       - run: cargo test --test sbpf -- --nocapture --test-threads=1
 
   typescript:

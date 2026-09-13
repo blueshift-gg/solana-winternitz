@@ -5,19 +5,17 @@
 [![Docs.rs](https://docs.rs/solana-winternitz/badge.svg)](https://docs.rs/solana-winternitz)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Generalized XMSS with target-sum Winternitz encoding, instantiated with
-Keccak-256 from [DKKW25](https://eprint.iacr.org/2025/055).
-Verification is `no_std` and uses Solana's `sol_keccak256` syscall.
+Hash-based signatures for Solana programs: target-sum Winternitz and a
+256-leaf XMSS tree, using Keccak-256. Verification is `no_std` and uses
+Solana's `sol_keccak256` syscall.
 
-Signing is stateful: each leaf permits one signing attempt, including failed
-salt sampling. This is an experimental instantiation with no independent
-audit. [SPEC.md](SPEC.md) defines its bytes and paper correspondence;
-[SECURITY.md](SECURITY.md) states its assumptions and signing-state rules.
-
-| Instance | Leaves per key | Signature | Public key | Verify CU |
+| Module | Max. signatures per key | Signature | Public key | Verify CU |
 |---|---:|---:|---:|---:|
-| `winternitz` | 1 | 849 B | 41 B | 34,371 |
-| `xmss` | 256 | 1,037 B | 41 B | 36,012 |
+| `winternitz` | 1 | 849 bytes | 41 bytes | 34,450 |
+| `xmss` | 256 | 1,037 bytes | 41 bytes | 36,116 |
+
+This is a custom instantiation of [DKKW25](https://eprint.iacr.org/2025/055),
+not RFC 8391 XMSS. It has not been independently audited.
 
 ## Usage
 
@@ -30,18 +28,17 @@ solana-winternitz = { git = "https://github.com/blueshift-gg/solana-winternitz" 
 use solana_winternitz::{Error, VerifyingKey, xmss};
 
 fn verify(key: &[u8], digest: &[u8; 32], signature: &[u8]) -> Result<(), Error> {
-    let key = VerifyingKey::from_slice(key)?;
-    key.verify(digest, &xmss::Signature::from_slice(signature)?)
+    let key = VerifyingKey::ref_from_bytes(key)?;
+    key.verify(digest, xmss::Signature::ref_from_bytes(signature)?)
 }
 ```
 
-Pass a `winternitz::Signature` for a one-leaf key. Verification takes a
-32-byte digest; the application defines its message framing and hashing.
-Constructors check encoded size; verification checks the signature.
+For a one-time key, use `winternitz::Signature`. Both verify a 32-byte digest;
+your application chooses how to hash its message.
 
 ### Signing
 
-Enable the host-only `sign` feature for a file-backed signer:
+Enable the `sign` feature for the host signer:
 
 ```rust,no_run
 # #[cfg(feature = "sign")]
@@ -49,7 +46,7 @@ Enable the host-only `sign` feature for a file-backed signer:
 use solana_winternitz::xmss;
 
 let mut signer = xmss::SigningKey::create("tree.key")?;
-let digest = [0u8; 32]; // The application's message digest.
+let digest = [0u8; 32]; // Replace with your message digest.
 let signature = signer.sign(&digest)?;
 signer.verifying_key().verify(&digest, &signature)?;
 # Ok(())
@@ -58,52 +55,40 @@ signer.verifying_key().verify(&digest, &signature)?;
 # fn main() {}
 ```
 
-`create` uses OS randomness and refuses an existing file. Resume with `open`.
-The signer persists the leaf before releasing a signature. It can replay the
-recorded signature for an identical message, including after reopening.
-A new attempt replaces that retry record, even if salt sampling fails.
+Resume with `SigningKey::open("tree.key")`. The signer persists each leaf before
+signing. Never restore an older key file or delete its `.lock` file: reusing a
+leaf can allow forgery. Failed signing attempts also spend a leaf; a failed transaction does not restore it.
 
-Keep one authoritative key file on a trusted local filesystem, accessed by
-the same path. Never restore an older state or remove the permanent `.lock`
-sidecar. A signature spends its leaf even if its transaction never lands.
+See [SECURITY.md](SECURITY.md) for state management and [SPEC.md](SPEC.md) for
+the construction and encoding.
 
-`hazmat` exposes key generation and `sign_at` for callers managing their own
-state. Reserve and persist a leaf before every attempt. `sign_at_with_salt`
-reproduces a signature from its recorded accepted salt. These methods provide
-no automatic protection against leaf reuse.
+## Example program
+
+The [program](program/src/lib.rs) verifies instruction data with no accounts:
+`[tag: 1][public key: 41][digest: 32][signature]`. Tag `0` selects Winternitz;
+tag `1` selects XMSS. Invalid signatures return `Custom(1)`.
+
+It checks the supplied signature only. A consuming application must bind the
+key to its authority and reject replayed messages or leaves.
+The [SBPF test](tests/sbpf.rs) constructs both instructions and measures their CU.
 
 ## TypeScript
 
-The [TypeScript package](packages/winternitz) supplies the same custom
-construction; Noble's SLH-DSA is a different signature scheme. The root export
-is pure verification. The `./signer` subpath provides file-backed signing on
-Bun/macOS and Bun/Linux with glibc, using the same file format and Unix locks
-as Rust.
-
-```ts
-import { xmss } from '@blueshift-gg/solana-winternitz/signer';
-
-using signer = xmss.SigningKey.create('tree.key');
-const signature = signer.sign(digest);
-signer.verifyingKey().verify(digest, signature);
-```
+The [TypeScript package](packages/winternitz) includes browser-compatible
+verification and a `./signer` export for file-backed signing under Bun.
 
 ## Tests
-
-CI runs fmt, strict Clippy, doctests, Rust and TypeScript tests, and SBPF
-verification. Tests cover independent reference signatures, parameter bounds,
-tampering, signing-state recovery and failure behavior.
 
 ```sh
 cargo test --lib --features sign
 cargo test --doc --features sign
-cargo test --test sbpf -- --nocapture --test-threads=1
+cargo build-sbf --arch v3 --manifest-path program/Cargo.toml
+cargo test --test sbpf -- --nocapture
 bun install --frozen-lockfile
 bun run test
 ```
 
-The CU figures above are fixture measurements under Mollusk, SBPF v3,
-platform-tools v1.56. SBPF tests require `cargo-build-sbf 4.2.0`.
+CU figures use SBPF v3. SBPF tests need `cargo-build-sbf 4.2.0`.
 
 ## License
 

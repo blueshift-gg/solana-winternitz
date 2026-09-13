@@ -1,14 +1,12 @@
-//! SBPF verification and CU measurements under Mollusk; needs `cargo build-sbf`.
-use core::hint::black_box;
-use solana_winternitz::{VerifyingKey, winternitz, xmss};
-use svm_unit_test::svm_test;
+//! Runs the example verifier on SBPF with valid and malformed instructions.
+use mollusk_svm::Mollusk;
+use solana_address::Address;
+use solana_instruction::Instruction;
 
 const MESSAGE: [u8; 32] = [
     0x2a, 0x32, 0x5d, 0xe5, 0xc3, 0x08, 0x46, 0xf9, 0x59, 0x8e, 0x4d, 0x83, 0xb9, 0xb0, 0xed, 0x8e,
     0xce, 0xd9, 0x45, 0xe5, 0x97, 0x95, 0x00, 0xf5, 0x28, 0x0c, 0xee, 0x9c, 0xc9, 0x48, 0x4a, 0xfd,
 ];
-/// A message whose encoding is off target under the fixture salt.
-const OTHER: [u8; 32] = [0; 32];
 const WINTERNITZ_KEY: [u8; 41] = [
     0xcc, 0x8d, 0xc9, 0x25, 0x81, 0x10, 0xd9, 0x49, 0xd5, 0xda, 0xd7, 0xec, 0x11, 0x53, 0x7b, 0x29,
     0x33, 0x23, 0xdb, 0x39, 0x02, 0x4e, 0x65, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51,
@@ -146,33 +144,51 @@ const XMSS_SIGNATURE: [u8; 1037] = [
     0x42, 0xb3, 0x84, 0xb6, 0xc5, 0x75, 0x89, 0xa3, 0xc6, 0xec, 0x6a, 0xbe, 0x5b,
 ];
 
-#[svm_test]
-fn winternitz_verify() {
-    let out = black_box(&VerifyingKey::from_bytes(&WINTERNITZ_KEY)).verify(
-        black_box(&MESSAGE),
-        black_box(&winternitz::Signature::from_bytes(&SIGNATURE)),
-    );
-    assert!(out.is_ok());
-    let _ = black_box(out);
-}
+#[test]
+fn example_program() {
+    let program = Address::new_from_array([1; 32]);
+    let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/deploy/solana_winternitz_example");
+    let svm = Mollusk::new(&program, elf.to_str().unwrap());
+    let run = |data: &[u8]| {
+        svm.process_instruction(&Instruction::new_with_bytes(program, data, vec![]), &[])
+    };
+    for (tag, key, signature) in [
+        (0, &WINTERNITZ_KEY, SIGNATURE.as_slice()),
+        (1, &XMSS_KEY, XMSS_SIGNATURE.as_slice()),
+    ] {
+        let data = [
+            vec![tag],
+            key.to_vec(),
+            MESSAGE.to_vec(),
+            signature.to_vec(),
+        ]
+        .concat();
+        let result = run(&data);
+        assert!(result.program_result.is_ok(), "{:?}", result.program_result);
+        assert!(result.compute_units_consumed < 45_000);
+        eprintln!("tag {tag}: {} CU", result.compute_units_consumed);
 
-#[svm_test]
-fn xmss_verify() {
-    let out = black_box(&VerifyingKey::from_bytes(&XMSS_KEY)).verify(
-        black_box(&MESSAGE),
-        black_box(&xmss::Signature::from_bytes(&XMSS_SIGNATURE)),
-    );
-    assert!(out.is_ok());
-    let _ = black_box(out);
-}
-
-/// This fixture rejects at the encoding, before any chain hash.
-#[svm_test]
-fn reject_off_target() {
-    let out = black_box(&VerifyingKey::from_bytes(&WINTERNITZ_KEY)).verify(
-        black_box(&OTHER),
-        black_box(&winternitz::Signature::from_bytes(&SIGNATURE)),
-    );
-    assert!(out.is_err());
-    let _ = black_box(out);
+        // Change the key, digest, salt and chain/path bytes independently.
+        for offset in [1, 42, 78, data.len() - 1] {
+            let mut bad = data.clone();
+            bad[offset] ^= 1;
+            assert!(run(&bad).program_result.is_err(), "offset {offset}");
+        }
+        for length in [0, 1, 41, 73, data.len() - 1] {
+            assert!(run(&data[..length]).program_result.is_err());
+        }
+        let mut bad = data.clone();
+        bad.push(0);
+        assert!(run(&bad).program_result.is_err());
+        bad.pop();
+        bad[0] = 2;
+        assert!(run(&bad).program_result.is_err());
+        if tag == 1 {
+            // The XMSS tree has leaves 0..256.
+            bad[0] = tag;
+            bad[74..78].copy_from_slice(&256u32.to_be_bytes());
+            assert!(run(&bad).program_result.is_err());
+        }
+    }
 }
