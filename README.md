@@ -11,11 +11,8 @@ Solana's `sol_keccak256` syscall.
 
 | Module | Max. signatures per key | Signature | Public key | Verify CU |
 |---|---:|---:|---:|---:|
-| `winternitz` | 1 | 849 bytes | 41 bytes | 34,450 |
-| `xmss` | 256 | 1,037 bytes | 41 bytes | 36,116 |
-
-This is a custom instantiation of [DKKW25](https://eprint.iacr.org/2025/055),
-not RFC 8391 XMSS. It has not been independently audited.
+| `winternitz` | 1 | 849 bytes | 41 bytes | ~34,800 |
+| `xmss` | 256 | 1,037 bytes | 41 bytes | ~36,500 |
 
 ## Usage
 
@@ -55,22 +52,27 @@ signer.verifying_key().verify(&digest, &signature)?;
 # fn main() {}
 ```
 
-Resume with `SigningKey::open("tree.key")`. The signer persists each leaf before
-signing. Never restore an older key file or delete its `.lock` file: reusing a
-leaf can allow forgery. Failed signing attempts also spend a leaf; a failed transaction does not restore it.
-
-See [SECURITY.md](SECURITY.md) for state management and [SPEC.md](SPEC.md) for
-the construction and encoding.
+Resume with `SigningKey::open("tree.key")`. Use one key file on a trusted local
+filesystem, always through the same path. Never restore an older copy or
+replace its `.lock` file. Signing attempts spend a leaf even on failure;
+a failed transaction does not restore it. Exact retries return the saved signature.
 
 ## Example program
 
-The [program](program/src/lib.rs) verifies instruction data with no accounts:
-`[tag: 1][public key: 41][digest: 32][signature]`. Tag `0` selects Winternitz;
-tag `1` selects XMSS. Invalid signatures return `Custom(1)`.
+The [program](program/src/lib.rs) creates a public-key account and verifies
+signatures against it. The [test](program/tests/registration.rs) generates keys,
+signs on the host, creates the account with the System Program, and submits
+signatures for both instances.
 
-It checks the supplied signature only. A consuming application must bind the
-key to its authority and reject replayed messages or leaves.
-The [SBPF test](tests/sbpf.rs) constructs both instructions and measures their CU.
+| Tag | Instruction data after tag | Operation |
+|---|---|---|
+| `0` | Public key, 41 bytes | Create a Winternitz key account |
+| `1` | Public key, 41 bytes | Create an XMSS key account |
+| `2` | Digest, 32 bytes, then signature | Verify and mark the leaf used |
+
+The key account signs creation and is writable for both operations. It holds
+an instance byte, the public key and a 32-byte used-leaf bitmap (74 bytes total).
+Reused leaves are rejected; unused XMSS leaves may arrive out of order.
 
 ## TypeScript
 
@@ -83,7 +85,7 @@ verification and a `./signer` export for file-backed signing under Bun.
 cargo test --lib --features sign
 cargo test --doc --features sign
 cargo build-sbf --arch v3 --manifest-path program/Cargo.toml
-cargo test --test sbpf -- --nocapture
+cargo test -p solana-winternitz-example --test registration -- --nocapture
 bun install --frozen-lockfile
 bun run test
 ```
@@ -93,3 +95,8 @@ CU figures use SBPF v3. SBPF tests need `cargo-build-sbf 4.2.0`.
 ## License
 
 [MIT](LICENSE).
+
+Based on [DKKW25](https://eprint.iacr.org/2025/055) and
+[hash-sig](https://github.com/b-wagn/hash-sig/tree/e66a48565d73c4d83d54e1b28fe249ab8c0d8542),
+using Keccak-256, sampled chain starts and at most 256 leaves. Not compatible
+with RFC 8391 XMSS. Unaudited.

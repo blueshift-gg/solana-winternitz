@@ -6,10 +6,6 @@ crate: generalized XMSS with target-sum encoding and Keccak-256.
 `winternitz` has one leaf per key; `xmss` has 256. Each leaf permits one
 signing attempt, including failed salt sampling.
 
-Experimental; no independent security audit. Read the
-[security assumptions](https://github.com/blueshift-gg/solana-winternitz/blob/main/SECURITY.md)
-before integrating.
-
 ```sh
 bun add @blueshift-gg/solana-winternitz @noble/hashes
 ```
@@ -57,8 +53,7 @@ message text. `using` closes the signer on normal and exceptional scope exit;
 synchronous CSPRNG fill callback, with the same persistence rules as `sign`.
 It is never called on an exact retry; RNG failure still spends the leaf.
 Raw `SecretKey` operations live exclusively in `./hazmat`; their caller owns
-leaf allocation and persistence. The [specification](https://github.com/blueshift-gg/solana-winternitz/blob/main/SPEC.md)
-defines the formats, raw inputs and reference vectors.
+leaf allocation and persistence.
 
 For caller-managed signing, `SecretKey.generate(fill)` samples a fresh key and
 `signAt(leaf, digest, fill)` samples an accepted salt before signing. The callback
@@ -78,3 +73,5 @@ secret.verifyingKey().verify(digest, signature);
 If the key survives a call, reserve and persist the leaf before calling `signAt`,
 including attempts that fail. `signAtWithSalt` reproduces a signature from a
 recorded accepted salt; it does not allocate a leaf or sample randomness.
+
+This is the Rust crate's custom Keccak-256 instantiation of DKKW25, not RFC 8391 XMSS. Unaudited.

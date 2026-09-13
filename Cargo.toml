@@ -8,7 +8,7 @@ edition = "2024"
 repository = "https://github.com/blueshift-gg/solana-winternitz"
 keywords = ["solana", "winternitz", "post-quantum", "hash-based", "no-std"]
 categories = ["cryptography", "no-std"]
-include = ["/src", "/tests", "/LICENSE", "/README.md", "/SPEC.md", "/SECURITY.md"]
+include = ["/src", "/tests", "/LICENSE", "/README.md"]
 
 [features]
 default = []
@@ -32,9 +32,6 @@ getrandom = { version = "0.3", optional = true }
 getrandom = "0.3"
 num-bigint = "0.4"
 serde_json = "1"
-mollusk-svm = "0.15.1"
-solana-address = "2.6.1"
-solana-instruction = "3.4.1"
 
 [workspace]
 members = ["program"]

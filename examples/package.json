@@ -1,6 +1,0 @@
-{
-  "name": "examples",
-  "private": true,
-  "type": "module",
-  "dependencies": { "@blueshift-gg/solana-winternitz": "workspace:*", "@noble/hashes": "^2.4.0" }
-}
