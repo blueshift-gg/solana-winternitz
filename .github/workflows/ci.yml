@@ -11,7 +11,6 @@ env:
 
 jobs:
   fmt:
-    name: cargo +nightly fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,7 +20,6 @@ jobs:
       - run: cargo +nightly fmt --all -- --check
 
   clippy:
-    name: cargo +nightly clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,14 +30,22 @@ jobs:
       - run: cargo +nightly clippy --all-targets --features sign -- -D warnings
 
   test:
-    name: cargo test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # SBPF correctness and CU tests run separately; they need cargo build-sbf.
-      - run: cargo test --lib
+      - run: cargo test --lib --features sign
+      - run: cargo test --doc --features sign
+
+  sbpf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install --locked cargo-build-sbf --version 4.2.0
+      - run: cargo test --test sbpf -- --nocapture --test-threads=1
 
   typescript:
     name: bun test

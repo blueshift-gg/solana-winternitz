@@ -3,7 +3,7 @@ Cargo.lock
 node_modules
 dist
 
-# Key files hold the seed and the spent-leaf record; only the test fixture is tracked.
+# Key files hold secrets and the spent-leaf record; only the test fixture is tracked.
 *.key
 *.key.lock
 *.key.tmp
