@@ -12,12 +12,9 @@ include = ["/src", "/tests", "/LICENSE", "/README.md", "/SPEC.md", "/SECURITY.md
 
 [features]
 default = []
-# Host-only key generation and signing (never compiled for `target_os =
-# "solana"`: signing on-chain reveals the secret key).
+# Host-only signing: secrets cannot be kept private on-chain.
 sign = ["dep:getrandom"]
-# Use the SBPF v3 static-syscall ABI (murmur3-hashed name → fn pointer) even
-# on toolchains that support it but do not advertise `target_feature =
-# "static-syscalls"`.
+# Enable the static-syscall ABI when the toolchain omits its target feature.
 static-syscalls = []
 
 [lints.rust]

@@ -1,108 +1,98 @@
 # Specification
 
-Every byte of the scheme as implemented, for a second implementer. The
-TypeScript package was written from this document and must reproduce
-[`tests/sampled.json`](tests/sampled.json) and
-[`tests/winternitz.key`](tests/winternitz.key) and verify
-[`tests/hash-sig.json`](tests/hash-sig.json) and
-[`tests/vectors.json`](tests/vectors.json). References are to
-[DKKW25](https://eprint.iacr.org/2025/055) and to its reference
-implementation [hash-sig](https://github.com/b-wagn/hash-sig) at commit
-`e66a485`.
+This document defines the two Keccak-256 instances implemented by the
+Rust crate and TypeScript package. References to constructions, lemmas
+and equations refer to [DKKW25], revision 2025-09-12. Security assumptions
+are in [SECURITY.md](SECURITY.md).
 
-## Parameters
+## Parameters and notation
 
 | Symbol | Value | Meaning |
 |---|---:|---|
-| `v` | 36 | chains, one per nibble of hash-sig's 18-byte message hash |
-| `2^w` | 16 | chain positions, `w = 4` |
-| `T` | 297 | required nibble sum, `⌈1.1 · 36 · 15 / 2⌉`, Construction 6 at §8's `δ = 1.1` |
-| `K` | 4096 | salt trials before signing fails, §8 |
-| `n` | 23 B | chain element, leaf and node |
-| `P` | 18 B | public parameter |
-| `ρ` | 21 B | salt |
-| `l_msg` | 32 B | message, hash-sig's `MESSAGE_LENGTH`: the caller's digest of what it acts on (Remark 1) |
-| `h` | 0 or 8 | tree height: `winternitz`, `xmss` |
+| `v` | 36 | number of chains |
+| `w` | 4 | bits per digit; chain positions are 0 through 15 |
+| `T` | 297 | accepted digit sum, `⌈1.1 · v · (2^w − 1) / 2⌉` (§8) |
+| `K` | 4096 | maximum salt candidates per signing attempt (§8) |
+| `n` | 184 bits | chain element, leaf hash and node hash: 23 bytes |
+| `P` | 18 bytes | public parameter |
+| `ρ` | 21 bytes | salt |
+| `m` | 32 bytes | application-supplied message digest (Remark 1) |
+| `h` | 0 or 8 | tree height: `winternitz` or `xmss` |
+| `L` | `2^h` | number of leaves |
+| `ℓ` (paper: `ep`) | `0 .. L−1` | leaf index, called an epoch in DKKW25; unrelated to a Solana epoch |
 
-The hash is Keccak-256, the `sol_keccak256` syscall, standing in for the
-paper's SHA3-256 (§7.2): the same permutation, rate and capacity, padding
-byte `0x01` for `0x06`. Every integer in a hash input or a wire format is
-big-endian except the leaf index inside the message tweak, little-endian
-as in hash-sig's `ShaMessageHash`.
+Indices are zero-based: `ℓ` is a leaf, `i` a chain, `k` a chain
+position, `l` a tree level and `j` a node index within that level.
+`‖` denotes concatenation. Parenthesized lengths below are in bytes.
+All integers are unsigned and big-endian except the leaf index in the
+message hash, which is little-endian as in [hash-sig].
 
 ## Hash inputs
 
-Chain, leaf and node inputs are `P ‖ T ‖ M` and the message input
-`ρ ‖ P ‖ T ‖ m`, §7.2.2 and §7.2.1, with the tweaks `T` of §7.1: a domain
-byte, eqs. (17) to (19), then the position. Outputs are truncated to `n`
-bytes, or to `v · w = 144` bits for the message. These are hash-sig's
-`ShaTweakHash<18, 23>` and `ShaMessageHash<18, 21, 36, 4>` with the hash
-swapped.
+Let `H` be Keccak-256. The functions follow §7.2's layouts `P ‖ t ‖ x`
+and `ρ ‖ P ‖ t ‖ m`, where `t` is a tweak with the domain byte and
+position fields of §7.1, equations (17)–(19).
 
-| Role | Input | Output |
-|---|---|---|
-| chain step | `P(18) ‖ 0x00 ‖ ℓ(4) ‖ i(1) ‖ k(1) ‖ x(23)`, 48 bytes | first 23 bytes |
-| leaf | `P(18) ‖ 0x01 ‖ 0x00 ‖ ℓ(4) ‖ pk_0 ‖ … ‖ pk_35`, 852 bytes | first 23 bytes |
-| node | `P(18) ‖ 0x01 ‖ l(1) ‖ j(4) ‖ left(23) ‖ right(23)`, 70 bytes | first 23 bytes |
-| message | `ρ(21) ‖ P(18) ‖ 0x02 ‖ ℓ(4, LE) ‖ m(32)`, 76 bytes | first 144 bits |
+| Role | Input to `H` | Input bytes | Output |
+|---|---|---:|---|
+| chain step | `P(18) ‖ 0x00 ‖ ℓ(4) ‖ i(1) ‖ k(1) ‖ x(23)` | 48 | first 23 bytes |
+| leaf | `P(18) ‖ 0x01 ‖ 0x00 ‖ ℓ(4) ‖ pk_0 ‖ … ‖ pk_35` | 852 | first 23 bytes |
+| node | `P(18) ‖ 0x01 ‖ l(1) ‖ j(4) ‖ left(23) ‖ right(23)` | 70 | first 23 bytes |
+| message | `ρ(21) ‖ P(18) ‖ 0x02 ‖ ℓ(4, LE) ‖ m(32)` | 76 | first 18 bytes |
 
-`ℓ` is the leaf index, the paper's epoch; `i` the chain, `k` the chain
-position, `l` the tree level, `j` the node index within the level. Every
-role has its own input length, so inputs of different roles are distinct
-strings whatever their content.
+The encoding reads each message-hash byte's low nibble, then its high
+nibble, yielding `x ∈ {0, …, 15}^36`. It accepts exactly when `Σ x_i = T`
+(Construction 6). Distinct accepted vectors are incomparable under
+coordinatewise ordering (Lemma 7).
 
-## Keys
+## Key generation
 
-Construction 3 Gen: every chain start `sk[ℓ][i]`, 23 bytes, and the
-18-byte parameter `P` are sampled from the operating system's random
-source, `getrandom` in Rust and `randomFillSync` in TypeScript. The chain
-starts are kept leaf-major, chain-major: 828 bytes per leaf, 828 bytes
-for `winternitz`, 211 968 for `xmss`. There is no seed.
+Sample `P` and each chain start `sk[ℓ][i]` independently and uniformly
+(Construction 3, Gen). The persistent signers use `getrandom::fill` in Rust and
+`randomFillSync` in TypeScript; `hazmat` key generation takes an explicit
+CSPRNG fill callback with requests of at most 828 bytes. Store the starts in leaf-major, then
+chain-major order: 828 bytes per leaf. There is no seed or PRF derivation.
+
+For each leaf and chain, define:
 
 ```text
-pk[ℓ][i]   = step(ℓ, i, 15, … step(ℓ, i, 1, sk[ℓ][i]))   chain ends, 15 steps
-leaf[ℓ]    = leaf hash of pk[ℓ][0..36]
-node[l][j] = node hash of node[l−1][2j], node[l−1][2j+1], l = 1 … h
-public key = root ‖ P,  root = leaf[0] when h = 0, node[h][0] when h = 8
+F[ℓ,i,0] = sk[ℓ][i]
+F[ℓ,i,k] = step(P, ℓ, i, k, F[ℓ,i,k−1])    for k = 1 … 15
+pk[ℓ][i] = F[ℓ,i,15]
 ```
 
-`step(ℓ, i, k, x)` is the chain-step hash with position `k`: the step
-into position `k` carries tweak `k`, as hash-sig's `chain` and
-Construction 2.
+The step entering position `k` uses tweak `k` (Construction 2).
+Hash the 36 chain ends into `node[0][ℓ]`. Build higher levels by hashing
+`node[l−1][2j] ‖ node[l−1][2j+1]` at level `l`, index `j`, for
+`l = 1 … h` (Construction 1). The root is `node[h][0]`; at height zero
+it is the sole leaf hash. The public key is `root ‖ P`.
 
-## Signing
+## Signing and verification
 
-Construction 3 Sig:
+For a fixed salt, signing takes a leaf `ℓ`, message `m` and salt `ρ`.
+The caller-managed `hazmat::SecretKey::sign_at` / `signAt` operation samples
+salts through an explicit CSPRNG callback; `sign_at_with_salt` /
+`signAtWithSalt` reproduces a signature using an already accepted salt.
+Reject an out-of-range leaf or a salt whose encoding fails. Otherwise,
+return chain values `σ_i = F[ℓ,i,x_i]` and the authentication path
+`node[l][(ℓ >> l) xor 1]` for `l = 0 … h−1`, leaf level first
+(Construction 3, Sig). An empty path is used at height zero.
 
-1. Sample a 21-byte salt `ρ` from the random source, at most `K` times.
-2. `x = encode(ρ, P, ℓ, m)`: the 18 bytes of the message hash as 36
-   nibbles, low nibble of each byte first (hash-sig's `bytes_to_chunks`).
-   Accept iff `Σ x_i = T`; otherwise sample again. Under a uniform model
-   one salt in ~111 is accepted and all `K` miss once in e^36.8, in which
-   case nothing is recorded and no leaf is spent.
-3. Record `ρ`, `m` and the next leaf in the key file (below), then
-   `σ_i = step(ℓ, i, x_i, … step(ℓ, i, 1, sk[ℓ][i]))`, the chain walked to
-   position `x_i`; `σ_i = sk[ℓ][i]` when `x_i = 0`.
-4. `xmss` only: the authentication path, `node[l][(ℓ >> l) ^ 1]` for
-   `l = 0 … 7`, leaf level first.
+To verify (Construction 3, Ver):
 
-Signing the recorded message again uses the recorded `ρ` and returns the
-same bytes. The raw operation, `sign_at` and `signAt`, takes an accepted
-`ρ`, refuses `ℓ ≥ 2^h` or a `ρ` that misses the target sum, and records
-nothing.
+1. Reject `ℓ ≥ L`; `winternitz` has implicit leaf zero.
+2. Encode the signature's salt and supplied message under `P` and `ℓ`;
+   reject if the sum is not `T`.
+3. Walk each `σ_i` from position `x_i` to 15, using tweaks `x_i+1 … 15`.
+   Lemma 2 gives the same chain ends as key generation.
+4. Hash the chain ends into the leaf, then climb the authentication path.
+   At level `l = 1 … h`, use index `j = ℓ >> l` and put the current node
+   on the left iff bit `l−1` of `ℓ` is zero (Construction 1, VerPath;
+   correctness is Lemma 1).
+5. Accept iff the computed root equals the public key's root.
 
-## Verification
-
-Construction 3 Ver, constant work for an accepted signature:
-
-1. `xmss`: reject if `ℓ ≥ 256`.
-2. `x = encode(ρ, P, ℓ, m)`; reject if `Σ x_i ≠ T`.
-3. `pk_i = step(ℓ, i, 15, … step(ℓ, i, x_i + 1, σ_i))`: walk each
-   element from `x_i` to 15, 243 steps in total.
-4. Leaf hash of the 36 ends. `xmss`: climb, at level `l = 1 … 8` with
-   index `j = ℓ >> l`, hashing `(current, sibling)` when bit `l − 1` of
-   `ℓ` is 0 and `(sibling, current)` when it is 1.
-5. Accept iff the result equals the public key's first 23 bytes.
+An accepted signature requires `36 · 15 − 297 = 243` chain hash steps.
+Verification neither records leaf use nor prevents replay.
 
 ## Wire formats
 
@@ -111,91 +101,87 @@ Construction 3 Ver, constant work for an accepted signature:
 | public key | `root(23) ‖ P(18)` | 41 |
 | `winternitz` signature | `ρ(21) ‖ σ_0 ‖ … ‖ σ_35` | 849 |
 | `xmss` signature | `ℓ(4) ‖ ρ(21) ‖ σ_0 ‖ … ‖ σ_35 ‖ path_0 ‖ … ‖ path_7` | 1,037 |
-| key file | `version(1) = 2 ‖ h(1) ‖ P(18) ‖ next leaf(4) ‖ message flag(1) ‖ last message(32) ‖ its salt(21) ‖ chain starts` | 906 or 212,046 |
 
-## Key file and lock
+All chain values and path entries are 23 bytes. Rust represents keys
+and signatures as fixed-size byte arrays; TypeScript constructors
+reject incorrect lengths.
 
-The key file is the key: it holds every chain start and is the only copy.
-It is created with mode 0600 and replaced atomically on every spent leaf:
-temp file `<file>.tmp`, fsync, rename, directory fsync. The message flag
-is 0 before the first signature, with the message and salt fields zero,
-and 1 after, with the last message and its accepted salt stored whole.
-A reader refuses a file whose length, version or `h` is wrong, whose
-flag disagrees with the next leaf, or whose salt does not encode the
-recorded message under leaf `next leaf − 1` to the target sum. `h` tags
-the instance so a file opens only under its own.
+## Persistent signer
 
-The open signer holds a kernel lock on `<file>.lock`, the same in both
-packages: open or create the sidecar without truncating it, take
-`flock(LOCK_EX | LOCK_NB)` on that descriptor, Rust's `File::try_lock`
-and libc's `flock` through Bun's FFI, and keep the descriptor for the
-signer's lifetime; a contended lock refuses before the record is read.
-Release closes the descriptor. The sidecar is permanent and is never
-deleted, renamed or replaced, since a new file at the path would be a
-second lock; its existence and content mean nothing. When a holder dies
-the kernel releases the lock and the next signer resumes from the
-record's next leaf. `flock` is advisory and per host: signers of one
-file share a host and a local filesystem. The TypeScript signer needs
-Bun on a unix host for the call; verification and key generation run
-anywhere.
+`SigningKey` supplies Construction 3's salt sampling and enforces one
+completed signing attempt per leaf (Definition 8). For a new attempt:
 
-## Vectors
+1. Sample independent 21-byte salt candidates, at most `K`, stopping at
+   the first accepted encoding.
+2. Advance `next_leaf`. On success, record the message and accepted salt.
+   On salt exhaustion or randomness failure, clear both fields.
+3. Persist the record before returning a signature or sampling error.
 
-`tests/sampled.json` pins signing in both packages from explicit,
-deliberately non-random test inputs stated in its `test_inputs` field:
-an `xmss` key whose chain-start byte `i` is `(i mod 251) xor 7` with `P`
-eighteen bytes of `0x57`, five leaves signed over the message `leaf` as
-a little-endian `u32` padded to 32 bytes, each with the first salt, a
-little-endian counter padded to 21 bytes, that encodes to the target
-sum; and the signature that `tests/winternitz.key`, a key file sampled
-at creation and then signed once, returns for its recorded message.
-`cargo test --lib regenerate_sampled_vectors -- --ignored` rewrites both.
+A retry of the recorded message uses its recorded salt at `next_leaf−1`,
+returning the same bytes without sampling or advancing. Each new attempt
+replaces that record; failure clears it. An exhausted key can still
+retry its recorded message. Raw `sign_at` / `signAt` does no allocation
+or persistence.
 
-`tests/hash-sig.json` holds the public key and five signatures of a key
-generated by hash-sig at commit `e66a485` with `sha3::Sha3_256` replaced
-by `sha3::Keccak256` in its three `sha.rs` files, at the type
-`GeneralizedXMSSSignatureScheme<ShaPRF<23, 21>, TargetSumEncoding<ShaMessageHash<18, 21, 36, 4>, 297>, ShaTweakHash<18, 23>, 8>`
-from `StdRng` seed 2025; the `source` field records this, and its
-`prf_key` is hash-sig's own key derivation, not used here. Both packages
-verify the signatures: the message hash, chunking, chains, leaf, tree and
-public key are the reference implementation's byte for byte.
-`tests/vectors.json` holds twenty further signatures from an earlier
-seed-derived key generation, kept as verification fixtures; `tests/sbpf.rs`
-embeds its case 1 of each instance and its case 0 message as the one to
-reject.
+The version 2 key file has a 78-byte header followed by all chain starts:
 
-## Differences from the paper and from hash-sig
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 1 | version, `2` |
+| 1 | 1 | height, `0` or `8` |
+| 2 | 18 | `P` |
+| 20 | 4 | `next_leaf`, big-endian |
+| 24 | 1 | message flag, `0` or `1` |
+| 25 | 32 | recorded message |
+| 57 | 21 | recorded salt |
+| 78 | `828 · L` | chain starts |
 
-| Where | Paper / hash-sig | Here | Why |
-|---|---|---|---|
-| hash function | SHA3-256 (§7.2), `sha3::Sha3_256` | Keccak-256 | the sponge Solana provides; software SHA3-256 exhausts the transaction budget; SECURITY.md §4.1 |
-| chain starts and salts | sampled (Construction 3); hash-sig derives both from a PRF key (Remark 7) | sampled, as the paper | SECURITY.md §4.2 |
-| lifetime | 2^18 and up in hash-sig's instantiations | 2^0 and 2^8 | lengths from the same script at these lifetimes |
-| salt trials | `K ≤ 4096` (§8); 100 000 in hash-sig | 4096 | the paper's |
-| wire format | epoch supplied beside the signature | epoch inside the `xmss` signature, absent at height 0 | one buffer per instruction |
-| key file, lock | none | above | local additions |
+Total length is 906 bytes for `winternitz`, 212,046 for `xmss`.
+Readers reject an incorrect length, version or instance height, a flag
+outside `{0,1}`, or `next_leaf > L`. Flag zero requires zero message and
+salt fields. Flag one requires `next_leaf > 0` and a salt that encodes
+the recorded message at `next_leaf−1` to the target sum. Version 1 seed
+files are rejected; using sampled keys requires application key rotation.
 
-Everything else is hash-sig's, and its signatures verify here.
+Creation uses exclusive file creation with mode 0600. Updates write
+`<file>.tmp`, fsync it, rename it over the key file and fsync the parent
+directory. A write failure releases no signature; drop/close and reopen
+the signer before continuing. Temporary files are ignored on open.
+`require_next_leaf_at_least(minimum)` / `requireNextLeafAtLeast(minimum)` rejects a record with `next_leaf < minimum`; it does not advance it.
 
-## Cost
+An open signer holds an exclusive, nonblocking kernel lock on the
+permanent `<file>.lock` sidecar. On Unix, Rust's `File::try_lock` and
+TypeScript's Bun FFI use `flock(LOCK_EX | LOCK_NB)`. Closing the descriptor
+releases the lock; process death releases it once no holder remains.
+Never delete or replace the sidecar: a different inode creates a second
+lock. [SECURITY.md](SECURITY.md#signer-state) specifies the filesystem
+and recovery assumptions.
 
-agave charges every hash syscall, `sol_keccak256` included, 85 CU plus
-`max(10, len / 2)` per slice.
+## Relationship to the sources
 
-| Verification step | Syscalls | CU |
-|---|---:|---:|
-| message hash, four slices | 1 | ~130 |
-| chain steps, one 48-byte slice each | 243 | ~26,500 |
-| leaf hash, three slices | 1 | ~520 |
-| tree nodes, `xmss` only, four slices each | 8 | ~1,000 |
+The generic construction is instantiated with Keccak-256 in place of
+§7.2's SHA3-256. Hash layouts, truncation and digit order follow
+[hash-sig]; widths are recomputed for `L ≤ 256`. Construction 3 samples
+starts and salts, whereas hash-sig derives them using a PRF. This signer
+uses the paper's sampling and `K = 4096` from §8. Its key file, lock and
+embedded leaf index are local conventions. These instances implement
+individual signatures; they do not implement the paper's aggregation
+construction.
 
-Measured under Mollusk with platform-tools v1.56: 34,331 CU for
-`winternitz`, 35,971 for `xmss`, 879 for a message off target. The
-remainder over the syscalls is SBPF instruction count. Measured and
-declined: three-slice chain steps, where the 10 CU minimum per slice
-exceeds the one copy; copying the chain ends into one leaf buffer, 200 to
-500 CU more than a third slice; SHA3-256 in software on the SBPF target,
-about 11,600 CU per call, which exhausts the 1,400,000 CU transaction
-maximum inside one verification. The earlier SHA-256 instantiation with
-35 chains and `T = 325` measured 29,524 and 31,224 CU; the difference is
-43 more chain steps at the paper's operating point.
+[Sampled vectors](tests/sampled.json) specify deliberately non-random
+inputs for Rust/TypeScript signing agreement. Leaves 127 and 128 exercise
+both path orientations at every level.
+[winternitz.key](tests/winternitz.key) is a public test key with one
+recorded signature; its secrets must never secure an application.
+Regenerate both with
+`cargo test --lib regenerate_sampled_vectors -- --ignored`.
+
+[Reference vector](tests/hash-sig.json) contains a signature from
+hash-sig with SHA3-256 replaced by Keccak-256. Its `source` field records
+the commit, type parameters and generation seed. It tests verification
+against an independent implementation; no reference key derivation is
+retained. [SBPF tests](tests/sbpf.rs) embed host-generated signatures for
+runtime verification and CU measurements.
+
+[DKKW25]: https://eprint.iacr.org/2025/055
+[hash-sig]: https://github.com/b-wagn/hash-sig/tree/e66a48565d73c4d83d54e1b28fe249ab8c0d8542

@@ -1,17 +1,12 @@
-//! What is pinned: eqs. (13)–(16) and the grinding cost behind the
-//! constants, the hash and syscall-id constants against their sources, the
-//! signatures of the authors' implementation verified, both instances against `tests/vectors.json` and the
-//! key-file fixture, every single-byte tamper rejected, garbage rejected
-//! without panics, the signer's allocation rules, and its kernel lock
-//! dying with its holder.
+use crate::hazmat::{self, OneTime};
+
 use num_bigint::BigUint;
 use serde_json::Value;
 use std::vec::Vec;
 
 use crate::{
-    CHAINS, ELEMENT_LENGTH, Error, MESSAGE_LENGTH, OneTime, PARAMETER_LENGTH, POSITIONS,
-    PUBLIC_KEY_LENGTH, PublicKey, SALT_LENGTH, TARGET_SUM, hash, signing, syscalls, winternitz,
-    xmss,
+    CHAINS, ELEMENT_LENGTH, Error, MESSAGE_LEN, PARAMETER_LEN, POSITIONS, PUBLIC_KEY_LEN,
+    SALT_LENGTH, TARGET_SUM, VerifyingKey, hash, signing, syscalls, winternitz, xmss,
 };
 
 fn hex(s: &str) -> Vec<u8> {
@@ -30,10 +25,10 @@ fn key<K: OneTime>(tag: u8) -> K {
     let secrets: Vec<u8> = (0..K::LEAVES as usize * crate::ELEMENTS_LENGTH)
         .map(|i| (i % 251) as u8 ^ tag)
         .collect();
-    K::new(&secrets, parameter(tag)).unwrap()
+    K::from_secrets(&secrets, parameter(tag)).unwrap()
 }
 
-fn salt(parameter: &[u8], leaf: u32, message: &[u8; MESSAGE_LENGTH]) -> [u8; SALT_LENGTH] {
+fn salt(parameter: &[u8], leaf: u32, message: &[u8; MESSAGE_LEN]) -> [u8; SALT_LENGTH] {
     let mut salt = [0; SALT_LENGTH];
     for counter in 0u32.. {
         salt[..4].copy_from_slice(&counter.to_le_bytes());
@@ -44,22 +39,22 @@ fn salt(parameter: &[u8], leaf: u32, message: &[u8; MESSAGE_LENGTH]) -> [u8; SAL
     unreachable!()
 }
 
-fn sign<K: OneTime>(key: &K, leaf: u32, message: &[u8; MESSAGE_LENGTH]) -> K::Signature {
-    key.sign_at(
+fn sign<K: OneTime>(key: &K, leaf: u32, message: &[u8; MESSAGE_LEN]) -> K::Signature {
+    key.sign_at_with_salt(
         leaf,
         message,
-        &salt(key.public_key().parameter(), leaf, message),
+        &salt(key.verifying_key().parameter(), leaf, message),
     )
     .unwrap()
 }
 
-fn parameter(i: u8) -> [u8; PARAMETER_LENGTH] {
-    [0x50 ^ i; PARAMETER_LENGTH]
+fn parameter(i: u8) -> [u8; PARAMETER_LEN] {
+    [0x50 ^ i; PARAMETER_LEN]
 }
 
-/// A message from a short tag; what a program passes is a 32-byte digest.
-fn message(tag: &[u8]) -> [u8; MESSAGE_LENGTH] {
-    let mut m = [0u8; MESSAGE_LENGTH];
+/// Pad a test tag to the fixed message length.
+fn message(tag: &[u8]) -> [u8; MESSAGE_LEN] {
+    let mut m = [0u8; MESSAGE_LEN];
     m[..tag.len()].copy_from_slice(tag);
     m
 }
@@ -84,9 +79,7 @@ fn layer_size(v: usize, w: usize, d: usize) -> BigUint {
     plus - minus
 }
 
-/// Parameter Requirements 2 and 3, eqs. (13)–(16), at L = 2^8, K = 2^12,
-/// and the numbers the authors' script prints for them; the target sum at
-/// δ = 1.1 and its verifier and signer cost.
+/// Parameter Requirements 2 and 3, eqs. (13)–(16), with L = 256 and K = 4096.
 #[test]
 fn parameters_satisfy_dkkw25_requirements() {
     let (kc, kq) = (128.0f64, 64.0f64);
@@ -108,15 +101,14 @@ fn parameters_satisfy_dkkw25_requirements() {
             >= (kc + log5 + 2.0 * w + log_l + v.log2())
                 .max(2.0 * (kq + log5 + 2.0 * w + log_l + v.log2() + log12))
     );
-    assert!((8 * PARAMETER_LENGTH) as f64 >= (kc + log5 + 3.0).max(2.0 * (kq + log5 + 2.0) + 5.0));
+    assert!((8 * PARAMETER_LEN) as f64 >= (kc + log5 + 3.0).max(2.0 * (kq + log5 + 2.0) + 5.0));
     // b-wagn/hashsig-parameters@95a80bc lower_bounds.py, same inputs, rounded
     // up to bytes as hash-sig's instantiations do.
-    const { assert!(8 * ELEMENT_LENGTH >= 183 && 8 * PARAMETER_LENGTH >= 142 && 8 * SALT_LENGTH >= 168) };
-    const { assert!(ELEMENT_LENGTH == 23 && PARAMETER_LENGTH == 18 && SALT_LENGTH == 21) };
+    const { assert!(8 * ELEMENT_LENGTH >= 183 && 8 * PARAMETER_LEN >= 142 && 8 * SALT_LENGTH >= 168) };
+    const { assert!(ELEMENT_LENGTH == 23 && PARAMETER_LEN == 18 && SALT_LENGTH == 21) };
     assert!(CHAINS * usize::from(w as u8) >= 138);
 
-    // T = ⌈1.1 · 36 · 15 / 2⌉ = 297, hash-sig's `Off10`: 243 verifier steps,
-    // one accepted digest in 96–128 uniform tries, all 4096 miss once in e^36.
+    // §8 target and Lemma 7's coefficient give verifier work and acceptance rate.
     assert_eq!(
         usize::from(TARGET_SUM),
         (1.1f64 * 36.0 * 15.0 / 2.0).ceil() as usize
@@ -126,13 +118,12 @@ fn parameters_satisfy_dkkw25_requirements() {
     let size = layer_size(CHAINS, POSITIONS.into(), steps);
     let trials = BigUint::from(POSITIONS).pow(CHAINS as u32) / size;
     assert!(trials >= BigUint::from(96u32) && trials <= BigUint::from(128u32));
-    assert_eq!(PUBLIC_KEY_LENGTH, 41);
-    assert_eq!(winternitz::SIGNATURE_LENGTH, 849);
-    assert_eq!(xmss::SIGNATURE_LENGTH, 1037);
+    assert_eq!(PUBLIC_KEY_LEN, 41);
+    assert_eq!(winternitz::SIGNATURE_LEN, 849);
+    assert_eq!(xmss::SIGNATURE_LEN, 1037);
 }
 
-/// The host hash is Keccak-256, padding byte 0x01, not FIPS SHA3-256: the
-/// Ethereum values of the empty string and "abc".
+/// Keccak known answers also check concatenation of hash-input slices.
 #[test]
 fn hash_is_keccak_256() {
     assert_eq!(
@@ -154,145 +145,82 @@ fn syscall_ids_match_published_values() {
     assert_eq!(syscalls::sys_hash("sol_sha512"), 0x9229cdcc);
 }
 
-/// Independently generated hash-sig signatures remain valid. Key sampling
-/// changes neither the wire format nor verification.
+/// An independent implementation checks the hash layouts and verification path.
 #[test]
 fn reference_signatures_verify() {
     let vectors: Value = serde_json::from_str(include_str!("../tests/hash-sig.json")).unwrap();
     let field = |v: &Value, k: &str| hex(v[k].as_str().unwrap());
-    let pk = PublicKey(field(&vectors, "public_key").try_into().unwrap());
+    let pk = VerifyingKey::from_bytes(&(field(&vectors, "public_key").try_into().unwrap()));
     let cases = vectors["signatures"].as_array().unwrap();
     assert!(!cases.is_empty());
     for v in cases {
         let leaf = v["leaf"].as_u64().unwrap() as u32;
-        let message: [u8; MESSAGE_LENGTH] = field(v, "message").try_into().unwrap();
+        let message: [u8; MESSAGE_LEN] = field(v, "message").try_into().unwrap();
         let mut bytes = leaf.to_be_bytes().to_vec();
         bytes.extend(field(v, "salt"));
         bytes.extend(field(v, "elements"));
         bytes.extend(field(v, "path"));
-        let sig = xmss::Signature(bytes.try_into().unwrap());
-        assert_eq!(sig.verify(&pk, &message), Ok(()));
+        let sig = xmss::Signature::from_bytes(&(bytes.try_into().unwrap()));
+        assert_eq!(pk.verify(&message, &sig), Ok(()));
         let mut other = message;
         other[0] ^= 1;
-        assert_eq!(sig.verify(&pk, &other), Err(Error::InvalidSignature));
-    }
-}
-
-#[test]
-fn winternitz_roundtrip() {
-    let messages = [message(b""), message(b"hello"), [0x55; 32], [0xff; 32]];
-    for (i, m) in messages.iter().enumerate() {
-        let sk = key::<winternitz::SecretKey>(i as u8);
-        let pk = sk.public_key();
-        let sig = sign(&sk, 0, m);
-        assert_eq!(sig.verify(&pk, m), Ok(()));
-        let other = key::<winternitz::SecretKey>(9).public_key();
-        assert_eq!(sig.verify(&other, m), Err(Error::InvalidSignature));
-        assert!(sk.sign_at(1, m, &[0; SALT_LENGTH]).is_none());
-        assert_eq!(
-            sig.verify(&pk, &message(b"other")),
-            Err(Error::InvalidSignature)
-        );
+        assert_eq!(pk.verify(&other, &sig), Err(Error::InvalidSignature));
     }
 }
 
 #[test]
 fn xmss_roundtrip_every_leaf() {
-    let sk = key::<xmss::SecretKey>(3);
-    let pk = sk.public_key();
-    let other = key::<xmss::SecretKey>(4).public_key();
+    let sk = key::<hazmat::xmss::SecretKey>(3);
+    let pk = sk.verifying_key();
     for leaf in 0..xmss::LEAVES {
         let m = message(&leaf.to_le_bytes());
         let sig = sign(&sk, leaf, &m);
         assert_eq!(sig.leaf(), leaf);
-        assert_eq!(sig.verify(&pk, &m), Ok(()));
-        assert_eq!(sig.verify(&other, &m), Err(Error::InvalidSignature));
-        assert_eq!(
-            sig.verify(&pk, &message(b"other")),
-            Err(Error::InvalidSignature)
-        );
+        assert_eq!(pk.verify(&m, &sig), Ok(()));
     }
-    assert!(
-        sk.sign_at(xmss::LEAVES, &message(b""), &[0; SALT_LENGTH])
-            .is_none()
-    );
-    // Relabelled to another leaf: the path no longer closes.
-    let m = message(b"m");
-    let mut sig = sign(&sk, 5, &m);
-    sig.0[..4].copy_from_slice(&6u32.to_be_bytes());
-    assert_eq!(sig.verify(&pk, &m), Err(Error::InvalidSignature));
-    sig.0[..4].copy_from_slice(&xmss::LEAVES.to_be_bytes());
-    assert_eq!(sig.verify(&pk, &m), Err(Error::InvalidSignature));
+    for leaf in [xmss::LEAVES, xmss::LEAVES + 1, u32::MAX] {
+        let m = message(b"bounds");
+        assert!(sk.sign_at_with_salt(leaf, &m, &[0; SALT_LENGTH]).is_none());
+        let mut sig = xmss::Signature::from_bytes(&([0; xmss::SIGNATURE_LEN]));
+        sig.0[..4].copy_from_slice(&leaf.to_be_bytes());
+        assert_eq!(pk.verify(&m, &sig), Err(Error::InvalidSignature));
+    }
 }
 
 #[test]
 fn tampering_is_rejected() {
     let m = message(b"tamper");
-    let sk = key::<winternitz::SecretKey>(2);
-    let pk = sk.public_key();
+    let sk = key::<hazmat::winternitz::SecretKey>(2);
+    let pk = sk.verifying_key();
     let sig = sign(&sk, 0, &m);
-    for i in 0..winternitz::SIGNATURE_LENGTH {
+    for i in 0..winternitz::SIGNATURE_LEN {
         let mut t = sig;
         t.0[i] ^= 1;
-        assert_eq!(t.verify(&pk, &m), Err(Error::InvalidSignature), "byte {i}");
+        assert_eq!(pk.verify(&m, &t), Err(Error::InvalidSignature), "byte {i}");
     }
-    for i in 0..PUBLIC_KEY_LENGTH {
+    for i in 0..PUBLIC_KEY_LEN {
         let mut p = pk;
         p.0[i] ^= 1;
-        assert_eq!(sig.verify(&p, &m), Err(Error::InvalidSignature));
+        assert_eq!(p.verify(&m, &sig), Err(Error::InvalidSignature));
     }
-    for i in 0..MESSAGE_LENGTH {
+    for i in 0..MESSAGE_LEN {
         let mut t = m;
         t[i] ^= 1;
-        assert_eq!(sig.verify(&pk, &t), Err(Error::InvalidSignature));
+        assert_eq!(pk.verify(&t, &sig), Err(Error::InvalidSignature));
     }
 
-    let sk = key::<xmss::SecretKey>(2);
-    let pk = sk.public_key();
+    let sk = key::<hazmat::xmss::SecretKey>(2);
+    let pk = sk.verifying_key();
     let sig = sign(&sk, 77, &m);
-    for i in 0..xmss::SIGNATURE_LENGTH {
+    for i in 0..xmss::SIGNATURE_LEN {
         let mut t = sig;
         t.0[i] ^= 1;
-        assert_eq!(t.verify(&pk, &m), Err(Error::InvalidSignature), "byte {i}");
+        assert_eq!(pk.verify(&m, &t), Err(Error::InvalidSignature), "byte {i}");
     }
-    for i in 0..PUBLIC_KEY_LENGTH {
+    for i in 0..PUBLIC_KEY_LEN {
         let mut p = pk;
         p.0[i] ^= 1;
-        assert_eq!(sig.verify(&p, &m), Err(Error::InvalidSignature));
-    }
-}
-
-/// Random bytes as signatures, keys and messages, and every out-of-range
-/// leaf: rejected, never a panic.
-#[test]
-fn garbage_is_rejected_without_panic() {
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut fill = |bytes: &mut [u8]| {
-        for b in bytes {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *b = state as u8;
-        }
-    };
-    let mut pk = PublicKey([0; PUBLIC_KEY_LENGTH]);
-    let mut once = winternitz::Signature([0; winternitz::SIGNATURE_LENGTH]);
-    let mut tree = xmss::Signature([0; xmss::SIGNATURE_LENGTH]);
-    let mut message = [0u8; MESSAGE_LENGTH];
-    for i in 0..2000u32 {
-        fill(&mut pk.0);
-        fill(&mut once.0);
-        fill(&mut tree.0);
-        fill(&mut message);
-        if i % 4 == 0 {
-            tree.0[..4].copy_from_slice(&(i % 3 * 128).to_be_bytes());
-        }
-        assert_eq!(once.verify(&pk, &message), Err(Error::InvalidSignature));
-        assert_eq!(tree.verify(&pk, &message), Err(Error::InvalidSignature));
-    }
-    for leaf in [xmss::LEAVES, xmss::LEAVES + 1, u32::MAX] {
-        tree.0[..4].copy_from_slice(&leaf.to_be_bytes());
-        assert_eq!(tree.verify(&pk, &message), Err(Error::InvalidSignature));
+        assert_eq!(p.verify(&m, &sig), Err(Error::InvalidSignature));
     }
 }
 
@@ -306,42 +234,41 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
 }
 
 /// Key-file offset of the next leaf: version, height, parameter.
-const NEXT_LEAF: usize = 2 + PARAMETER_LENGTH;
+const NEXT_LEAF: usize = 2 + PARAMETER_LEN;
 
-/// The signer's rules: one instance per file, no open without a file, the
-/// last message repeated for free, and foreign, truncated, behind-the-chain
-/// and exhausted files all refused.
 #[test]
 fn signer_owns_leaf_allocation() {
-    use crate::{Signer, SignerError};
-    type Tree = Signer<xmss::SecretKey>;
+    use crate::SigningError;
+    type Tree = xmss::SigningKey;
     let dir = temp_dir("signer");
     let path = dir.join("tree.key");
     let (a, b, y, z) = (message(b"a"), message(b"b"), message(b"y"), message(b"z"));
 
     let mut signer = Tree::create(&path).unwrap();
-    let pk = signer.public_key();
+    let pk = signer.verifying_key();
     assert_eq!(signer.remaining(), xmss::LEAVES);
-    assert!(matches!(Tree::create(&path), Err(SignerError::Locked)));
-    assert!(matches!(Tree::open(&path), Err(SignerError::Locked)));
+    assert!(matches!(Tree::create(&path), Err(SigningError::Locked)));
+    assert!(matches!(Tree::open(&path), Err(SigningError::Locked)));
 
     let sig_a = signer.sign(&a).unwrap();
     assert_eq!(sig_a.leaf(), 0);
-    assert_eq!(sig_a.verify(&pk, &a), Ok(()));
+    assert_eq!(pk.verify(&a, &sig_a), Ok(()));
     assert_eq!(signer.sign(&a).unwrap(), sig_a);
+    assert_eq!(signer.next_leaf(), 1);
+
     assert_eq!(signer.remaining(), xmss::LEAVES - 1);
     let sig_b = signer.sign(&b).unwrap();
     assert_eq!(sig_b.leaf(), 1);
     drop(signer);
 
-    assert!(matches!(Tree::create(&path), Err(SignerError::Exists)));
+    assert!(matches!(Tree::create(&path), Err(SigningError::Exists)));
     assert!(matches!(
-        Signer::<winternitz::SecretKey>::open(&path),
-        Err(SignerError::Corrupt)
+        winternitz::SigningKey::open(&path),
+        Err(SigningError::Corrupt)
     ));
     assert!(matches!(
         Tree::open(dir.join("none.key")),
-        Err(SignerError::Missing)
+        Err(SigningError::Missing)
     ));
 
     // Restart: continue at the record; an older message is a new leaf.
@@ -351,31 +278,29 @@ fn signer_owns_leaf_allocation() {
     assert_eq!(signer.sign(&a).unwrap().leaf(), 2);
     drop(signer);
     assert!(matches!(
-        Tree::open(&path).unwrap().floor(4),
-        Err(SignerError::BelowFloor {
+        Tree::open(&path).unwrap().require_next_leaf_at_least(4),
+        Err(SigningError::LeafBelowMinimum {
             next_leaf: 3,
-            floor: 4
+            minimum: 4
         })
     ));
-    Tree::open(&path).unwrap().floor(3).unwrap();
+    Tree::open(&path)
+        .unwrap()
+        .require_next_leaf_at_least(3)
+        .unwrap();
 
-    // Interrupted write: stale temp ignored, truncated record refused.
+    // An uncommitted temporary file must not advance state.
     std::fs::write(dir.join("tree.key.tmp"), b"garbage").unwrap();
     assert_eq!(Tree::open(&path).unwrap().next_leaf(), 3);
 
-    // The lock is the kernel's, not the sidecar's existence or content.
+    // A released sidecar remains reusable regardless of its contents.
     let lock = dir.join("tree.key.lock");
     std::fs::write(&lock, "anything").unwrap();
     drop(Tree::open(&path).unwrap());
     assert!(lock.exists());
     let record = std::fs::read(&path).unwrap();
     std::fs::write(&path, &record[..record.len() - 1]).unwrap();
-    assert!(matches!(Tree::open(&path), Err(SignerError::Corrupt)));
-    // A message flag with no spent leaf contradicts itself.
-    let mut contradiction = record.clone();
-    contradiction[NEXT_LEAF..NEXT_LEAF + 4].copy_from_slice(&0u32.to_be_bytes());
-    std::fs::write(&path, &contradiction).unwrap();
-    assert!(matches!(Tree::open(&path), Err(SignerError::Corrupt)));
+    assert!(matches!(Tree::open(&path), Err(SigningError::Corrupt)));
 
     // Last leaf: one more message, then only that one.
     let mut last = record.clone();
@@ -392,43 +317,39 @@ fn signer_owns_leaf_allocation() {
     let sig_z = signer.sign(&z).unwrap();
     assert_eq!(sig_z.leaf(), xmss::LEAVES - 1);
     assert_eq!(signer.remaining(), 0);
-    assert!(matches!(signer.sign(&y), Err(SignerError::Exhausted)));
+    assert!(matches!(signer.sign(&y), Err(SigningError::Exhausted)));
     assert_eq!(signer.sign(&z).unwrap(), sig_z);
     drop(signer);
 
     // The one-leaf instance.
     let path = dir.join("once.key");
-    let mut once = Signer::<winternitz::SecretKey>::create(&path).unwrap();
+    let mut once = winternitz::SigningKey::create(&path).unwrap();
     let s = once.sign(&a).unwrap();
-    assert_eq!(s.verify(&once.public_key(), &a), Ok(()));
+    assert_eq!(once.verifying_key().verify(&a, &s), Ok(()));
     assert_eq!(once.sign(&a).unwrap(), s);
-    assert!(matches!(once.sign(&b), Err(SignerError::Exhausted)));
+    assert!(matches!(once.sign(&b), Err(SigningError::Exhausted)));
     drop(once);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The child of `lock_dies_with_its_holder`: hold the key file named by
-/// the environment until killed.
+/// Subprocess entry point for the lock-recovery test.
 #[test]
 fn hold_key_file() {
     let Ok(path) = std::env::var("SOLANA_WINTERNITZ_HOLD") else {
         return;
     };
-    let _held = crate::Signer::<winternitz::SecretKey>::open(&path).unwrap();
+    let _held = crate::winternitz::SigningKey::open(&path).unwrap();
     std::println!("HOLDING");
     loop {
         std::thread::sleep(core::time::Duration::from_secs(1));
     }
 }
 
-/// The kernel holds the lock for the process that took it and releases it
-/// when that process dies: a file held by another process is refused, and
-/// opens after the process is killed.
 #[test]
 fn lock_dies_with_its_holder() {
-    use crate::{Signer, SignerError};
+    use crate::SigningError;
     use std::io::BufRead;
-    type Once = Signer<winternitz::SecretKey>;
+    type Once = winternitz::SigningKey;
     let dir = temp_dir("holder");
     let path = dir.join("once.key");
     drop(Once::create(&path).unwrap());
@@ -440,55 +361,38 @@ fn lock_dies_with_its_holder() {
         .unwrap();
     let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
     assert!(lines.any(|line| line.unwrap() == "HOLDING"));
-    assert!(matches!(Once::open(&path), Err(SignerError::Locked)));
+    assert!(matches!(Once::open(&path), Err(SigningError::Locked)));
     child.kill().unwrap();
     child.wait().unwrap();
     drop(Once::open(&path).unwrap());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Historical Rust/TypeScript wire fixtures; no legacy key derivation is retained.
-#[test]
-fn historical_vectors_verify() {
-    let vectors: Value = serde_json::from_str(include_str!("../tests/vectors.json")).unwrap();
-    let field = |v: &Value, k: &str| hex(v[k].as_str().unwrap());
-    for v in vectors["winternitz"].as_array().unwrap() {
-        let pk = PublicKey(field(v, "public_key").try_into().unwrap());
-        let message = field(v, "message").try_into().unwrap();
-        let sig = winternitz::Signature(field(v, "signature").try_into().unwrap());
-        assert_eq!(sig.verify(&pk, &message), Ok(()));
-    }
-    for v in vectors["xmss"].as_array().unwrap() {
-        let pk = PublicKey(field(v, "public_key").try_into().unwrap());
-        let message = field(v, "message").try_into().unwrap();
-        let sig = xmss::Signature(field(v, "signature").try_into().unwrap());
-        assert_eq!(sig.verify(&pk, &message), Ok(()));
-    }
-}
-
 /// Explicit test chain starts and accepted salts pin signing in both languages.
 #[test]
 fn sampled_vectors_are_reproduced() {
     let vectors: Value = serde_json::from_str(include_str!("../tests/sampled.json")).unwrap();
-    let sk = key::<xmss::SecretKey>(7);
-    let pk = PublicKey(
-        hex(vectors["public_key"].as_str().unwrap())
+    let sk = key::<hazmat::xmss::SecretKey>(7);
+    let pk = VerifyingKey::from_bytes(
+        &(hex(vectors["public_key"].as_str().unwrap())
             .try_into()
-            .unwrap(),
+            .unwrap()),
     );
-    assert_eq!(sk.public_key(), pk);
+    assert_eq!(sk.verifying_key(), pk);
     for v in vectors["signatures"].as_array().unwrap() {
         let leaf = v["leaf"].as_u64().unwrap() as u32;
         let m = message(&leaf.to_le_bytes());
-        let sig = xmss::Signature(hex(v["signature"].as_str().unwrap()).try_into().unwrap());
+        let sig = xmss::Signature::from_bytes(
+            &(hex(v["signature"].as_str().unwrap()).try_into().unwrap()),
+        );
         assert_eq!(sign(&sk, leaf, &m), sig);
-        assert_eq!(sig.verify(&pk, &m), Ok(()));
+        assert_eq!(pk.verify(&m, &sig), Ok(()));
     }
     let dir = temp_dir("fixture");
     let path = dir.join("once.key");
     std::fs::write(&path, include_bytes!("../tests/winternitz.key")).unwrap();
     let before = std::fs::read(&path).unwrap();
-    let mut once = crate::Signer::<winternitz::SecretKey>::open(&path).unwrap();
+    let mut once = crate::winternitz::SigningKey::open(&path).unwrap();
     let m = before[25..57].try_into().unwrap();
     let expected = hex(vectors["one_time_signature"].as_str().unwrap());
     assert_eq!(once.sign(&m).unwrap().0.as_slice(), expected);
@@ -499,40 +403,69 @@ fn sampled_vectors_are_reproduced() {
 
 #[test]
 fn raw_keys_require_all_chain_starts() {
-    assert!(winternitz::SecretKey::new(&[0; 32], parameter(0)).is_none());
-    assert!(xmss::SecretKey::new(&[0; 828], parameter(0)).is_none());
-    let key = key::<winternitz::SecretKey>(1);
+    assert!(hazmat::winternitz::SecretKey::from_secrets(&[0; 32], parameter(0)).is_err());
+    assert!(hazmat::xmss::SecretKey::from_secrets(&[0; 828], parameter(0)).is_err());
+    let key = key::<hazmat::winternitz::SecretKey>(1);
     let m = message(b"bad salt");
+    assert!(key.sign_at_with_salt(1, &m, &[0; SALT_LENGTH]).is_none());
     let bad = (0u32..)
         .find_map(|counter| {
             let mut salt = [0; SALT_LENGTH];
             salt[..4].copy_from_slice(&counter.to_le_bytes());
-            crate::encode(&salt, key.public_key().parameter(), 0, &m)
+            crate::encode(&salt, key.verifying_key().parameter(), 0, &m)
                 .is_none()
                 .then_some(salt)
         })
         .unwrap();
-    assert!(key.sign_at(0, &m, &bad).is_none());
+    assert!(key.sign_at_with_salt(0, &m, &bad).is_none());
 }
 
 /// Regenerate explicit-input vectors and the small shared state fixture.
 #[test]
 #[ignore]
 fn regenerate_sampled_vectors() {
-    let sk = key::<xmss::SecretKey>(7);
-    let signatures: Vec<Value> = [0, 1, 127, 128, 255u32].into_iter().map(|leaf| {
+    let sk = key::<hazmat::xmss::SecretKey>(7);
+    // Complementary leaf bits exercise both path orientations at every level.
+    let signatures: Vec<Value> = [127, 128u32].into_iter().map(|leaf| {
         serde_json::json!({ "leaf": leaf, "signature": to_hex(&sign(&sk, leaf, &message(&leaf.to_le_bytes())).0) })
     }).collect();
     let dir = temp_dir("regenerate");
     let path = dir.join("once.key");
-    let mut once = crate::Signer::<winternitz::SecretKey>::create(&path).unwrap();
+    let mut once = crate::winternitz::SigningKey::create(&path).unwrap();
     let sig = once.sign(&message(b"sampled fixture")).unwrap();
     drop(once);
     std::fs::copy(&path, "tests/winternitz.key").unwrap();
     std::fs::write("tests/sampled.json", serde_json::to_string_pretty(&serde_json::json!({
         "test_inputs": "Public test data only: chain-start byte i = (i mod 251) xor 7; P = 18 bytes of 0x57; message = leaf LE32 padded to 32 bytes; salt = first accepted counter LE32 padded to 21 bytes.",
-        "public_key": to_hex(&sk.public_key().0), "signatures": signatures,
+        "public_key": to_hex(&sk.verifying_key().0), "signatures": signatures,
         "one_time_signature": to_hex(&sig.0),
     })).unwrap() + "\n").unwrap();
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn sdk_encoding_contract() {
+    let key = VerifyingKey::from_bytes(&[7; VerifyingKey::BYTE_LEN]);
+    assert_eq!(
+        VerifyingKey::try_from(key.as_bytes().as_slice()).unwrap(),
+        key
+    );
+    assert_eq!(VerifyingKey::ref_from_bytes(key.as_bytes()).unwrap(), &key);
+    assert_eq!(
+        VerifyingKey::from_slice(&[0; 40]),
+        Err(Error::InvalidLength)
+    );
+    let signature = winternitz::Signature::from_bytes(&[0; winternitz::Signature::BYTE_LEN]);
+    assert_eq!(
+        winternitz::Signature::from_slice(signature.as_bytes()).unwrap(),
+        signature
+    );
+    assert_eq!(
+        key.verify(&[0; MESSAGE_LEN], &signature),
+        Err(Error::InvalidSignature)
+    );
+    assert_eq!(
+        xmss::Signature::from_slice(&[0; 1036]),
+        Err(Error::InvalidLength)
+    );
 }

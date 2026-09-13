@@ -1,51 +1,80 @@
 # `@blueshift-gg/solana-winternitz`
 
-Create post-quantum hash-based signatures that the `solana-winternitz`
-crate verifies on-chain: `winternitz` for one signature per key, `xmss`
-for 256. DKKW25's generalized XMSS at hash-sig's parameters, Keccak-256
-for SHA3-256, keys sampled as the paper writes them; hash-sig's
-signatures verify here.
+TypeScript signing and verification for the
+[Solana Winternitz](https://github.com/blueshift-gg/solana-winternitz)
+crate: generalized XMSS with target-sum encoding and Keccak-256.
+`winternitz` has one leaf per key; `xmss` has 256. Each leaf permits one
+signing attempt, including failed salt sampling.
+
+Experimental; no independent security audit. Read the
+[security assumptions](https://github.com/blueshift-gg/solana-winternitz/blob/main/SECURITY.md)
+before integrating.
 
 ```sh
-bun add @blueshift-gg/solana-winternitz
+bun add @blueshift-gg/solana-winternitz @noble/hashes
 ```
 
 ```ts
 import { keccak_256 } from '@noble/hashes/sha3.js';
-import { Signer, winternitz, xmss } from '@blueshift-gg/solana-winternitz';
+import { xmss } from '@blueshift-gg/solana-winternitz/signer';
 
-const signer = Signer.create(xmss.SecretKey, 'tree.key'); // samples the key and builds 256 leaves; refuses an existing file
-const treeKey = signer.publicKey; // 41 bytes, store this on-chain
-const message = keccak_256(payload); // 32 bytes: the digest the program computes over what it acts on
-const signature = signer.sign(message); // spends leaf 0, recorded in the file before it is computed
-signature.verify(treeKey, message); // throws on failure
-signer.sign(message); // the same message again: same bytes, no leaf spent
-signer.close(); // releases the file
-
-const again = Signer.open(xmss.SecretKey, 'tree.key').floor(lastAcceptedOnChain + 1); // continues at leaf 1
-const once = Signer.create(winternitz.SecretKey, 'once.key'); // the one-leaf case
+using signer = xmss.SigningKey.create('tree.key');
+const message = keccak_256(new TextEncoder().encode('example'));
+const publicKey = signer.verifyingKey();
+const signature = signer.sign(message);
+publicKey.verify(message, signature);
 ```
 
-A message is a 32-byte digest; the program hashes whatever it acts on
-and passes the digest, so sign the same digest. `create` samples every
-chain start and the parameter from the operating system's random
-source and refuses an existing file; `open` takes only the file, so no
-key starts at leaf 0 by accident. The key file is the key and its only
-copy: chain starts, parameter, next leaf and the last message with its
-salt, 906 bytes for `winternitz` and 212,046 for `xmss`, mode 0600,
-replaced atomically on every spent leaf. Back up the file. One process holds a file at a time through
-a kernel lock, `flock`, on a permanent `.lock` sidecar, the same call
-the Rust signer makes, so the two honour each other's locks and the OS
-releases a dead holder's. `Signer` reaches `flock` through Bun's FFI, so
-it needs Bun on a unix host; verification and key generation run
-anywhere. A leaf is spent the moment
-its signature leaves the machine, whether or not the transaction lands,
-so the record is written before the signature is computed, and the last
-message signed again returns the same bytes without spending one.
-`signAt(leaf, message, salt)` on either key is the primitive underneath:
-it takes an accepted salt, records nothing and refuses a leaf out of
-range. Byte getters return copies.
+`create` samples the chain starts and public parameter from the OS random
+source and refuses an existing file. Use
+`xmss.SigningKey.open('tree.key')` to resume, or substitute
+`winternitz.SigningKey` from the same subpath for the one-leaf instance. Messages must be
+32-byte digests of the application's authorized payload.
 
-The repository's [SPEC.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SPEC.md)
-defines every byte and [SECURITY.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SECURITY.md)
-the claim and its assumptions.
+`sign` persists the attempt before returning. Retrying the recorded
+message returns identical signature bytes, including after reopening.
+A new attempt replaces that record; salt exhaustion or randomness failure
+spends the leaf and clears it. A write failure closes the signer.
+`nextLeaf()` and `remaining()` report allocation state; `requireNextLeafAtLeast(minimum)` rejects
+a record below a caller-supplied lower bound without advancing it.
+
+Keep one authoritative key file on a trusted local filesystem, using
+the same path. Never restore an older state or remove the permanent
+`.lock` sidecar. Rust and TypeScript share the record and lock formats.
+`SigningKey` requires Bun on macOS or Linux with glibc; the pure package root also
+runs in browsers, workers and Node.
+
+Import `VerifyingKey`, `xmss` and `winternitz` from the package root to verify
+without a file or platform dependencies. Use `VerifyingKey.fromBytes(bytes)` and `xmss.Signature.fromBytes(bytes)`
+(or `winternitz.Signature.fromBytes`) to decode exact-size encodings.
+`toBytes()` returns a copy. Each encoded type exposes `BYTE_LEN`.
+`key.verify(message, signature)` throws `CryptoError` with code
+`InvalidLength` or `InvalidSignature`. Signing and persistence failures throw
+`SigningError` with a stable code and preserve underlying I/O errors as `cause`.
+`ErrorCode` and `SigningErrorCode` are exported unions; match `code`, not
+message text. `using` closes the signer on normal and exceptional scope exit;
+`close()` is also available. `signWithRng(message, fill)` accepts an explicit
+synchronous CSPRNG fill callback, with the same persistence rules as `sign`.
+It is never called on an exact retry; RNG failure still spends the leaf.
+Raw `SecretKey` operations live exclusively in `./hazmat`; their caller owns
+leaf allocation and persistence. The [specification](https://github.com/blueshift-gg/solana-winternitz/blob/main/SPEC.md)
+defines the formats, raw inputs and reference vectors.
+
+For caller-managed signing, `SecretKey.generate(fill)` samples a fresh key and
+`signAt(leaf, digest, fill)` samples an accepted salt before signing. The callback
+must fill every byte with CSPRNG output; requests are at most 828 bytes.
+
+```ts
+import { winternitz } from '@blueshift-gg/solana-winternitz/hazmat';
+
+const fill = (out: Uint8Array) => { crypto.getRandomValues(out); };
+const secret = winternitz.SecretKey.generate(fill);
+const digest = new Uint8Array(32); // Replace with the application's message digest.
+// This fresh one-leaf key is used once and discarded, including on failure.
+const signature = secret.signAt(0, digest, fill);
+secret.verifyingKey().verify(digest, signature);
+```
+
+If the key survives a call, reserve and persist the leaf before calling `signAt`,
+including attempts that fail. `signAtWithSalt` reproduces a signature from a
+recorded accepted salt; it does not allocate a leaf or sample randomness.

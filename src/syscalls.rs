@@ -1,10 +1,5 @@
-//! Raw binding for `sol_keccak256`. Only compiled for `target_os = "solana"`.
-//!
-//! SBPF v3 toolchains set `target_feature = "static-syscalls"` and dispatch
-//! syscalls by the murmur3 hash of their name; older toolchains link the
-//! symbol dynamically. The hash is computed at compile time with the same
-//! function `solana-define-syscall` uses (`sys_hash`), and the tests check
-//! it against the published value.
+//! `sol_keccak256` binding. Static syscalls use the Murmur3 hash of the name;
+//! dynamic syscalls use the linked symbol.
 
 #[cfg(all(
     target_os = "solana",
@@ -29,9 +24,7 @@ pub unsafe fn sol_keccak256(vals: *const u8, val_len: u64, hash_result: *mut u8)
     f(vals, val_len, hash_result)
 }
 
-/// murmur3_32(name, 0): the static-syscall id. Same algorithm as
-/// `solana_define_syscall::sys_hash` (anza-xyz/agave, `define-syscall/src/lib.rs`).
-/// Only reached on static-syscall builds and in the tests.
+/// Static-syscall ID, as in `solana_define_syscall::sys_hash`.
 #[allow(dead_code)]
 pub const fn sys_hash(name: &str) -> usize {
     murmur3_32(name.as_bytes(), 0) as usize

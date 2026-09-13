@@ -1,377 +1,172 @@
-# Security analysis
+# Security
 
-This document states the security claim of the crate, the model in which
-it holds, the bound it rests on evaluated at the implemented parameters,
-the arguments for each point at which the implementation differs from
-[DKKW25] and its reference implementation [hash-sig], the attacks that
-were considered with their costs, the operational assumptions the model
-requires, and what remains unproven. The code has not been audited.
-Byte-level definitions are in [SPEC.md](SPEC.md).
+This is experimental cryptographic software. It has not received an
+independent security audit or formal verification. The security target
+is 128 bits classical and 64 bits quantum, conditional on the hash and
+state assumptions below. The construction and formats are defined in
+[SPEC.md](SPEC.md).
 
-## 1. Scheme
+## Construction and assumptions
 
-The crate implements the generalized XMSS signature of [DKKW25,
-Construction 3] with the target-sum encoding of [DKKW25, Construction 6]
-and lifetime `L ∈ {1, 2^8}`, in the SHA-3 instantiation of [DKKW25, §7.2]
-with Keccak-256 in place of SHA3-256 (§4.1). Key generation and signing
-sample as the paper writes them: every chain start, the public parameter
-`P` and every salt candidate is drawn from the operating system's random
-source, with no seed and no pseudorandom function in between (§4.2).
-Tweaks are the byte strings of §7.1; `ℓ` is the leaf index, the paper's
-epoch. Messages are 32-byte digests, `l_msg = 256` as in [hash-sig], the
-compression of longer inputs being the caller's as Remark 1 prescribes.
-The lengths are those of [hash-sig]'s SHA-3 target-sum instantiation for
-`w = 4`, recomputed for these lifetimes.
+The scheme is generalized XMSS with target-sum encoding: [DKKW25],
+Constructions 3 and 6. Its security model is synchronized strong
+unforgeability (Definition 8): an adversary may request one signature
+per leaf and must produce an accepted message/signature pair that was
+not returned for that leaf. A failed signing query also consumes its
+leaf. Replaying the identical pair is outside this forgery definition.
 
-| Function | Definition | Role in [DKKW25] |
-|---|---|---|
-| `Th(P, t, x) = Keccak-256(P ‖ t ‖ x)[0..184]` | chain step, leaf and node; `t` a chain or tree tweak | `Th` of §7.2.2, Constructions 1 and 2 |
-| `Th_msg(P, ℓ, ρ, m) = Keccak-256(ρ ‖ P ‖ 0x02 ‖ ℓ ‖ m)[0..144]` | encoding input, read as 36 nibbles | `Th_msg` of §7.2.1, Construction 6 |
+Theorem 1 and Corollary 2 reduce security to the following properties
+of the instantiated tweakable hash functions:
 
-| Parameter | Value | Requirement | Margin |
-|---|---:|---|---:|
-| `v · w`, digest bits | 144 | ≥ 137.64, eq. (13) | 6.4 bits |
-| `log₂ |R|`, salt bits | 168 | ≥ 167.81, eq. (14), `L = 2^8`, `K = 2^12` | 0.2 bits |
-| `n`, chain element bits | 184 | ≥ 182.15, eq. (15), `L = 2^8` | 1.9 bits |
-| `log₂ |P|`, parameter bits | 144 | ≥ 141.64, eq. (16) | 2.4 bits |
-| `T`, target sum | 297 | Construction 6 at `δ = 1.1`, [DKKW25, §8] | see below |
+- Multi-target collision resistance for the tree and chain hashes
+  (Definition 3).
+- Target collision resistance with random sampling for the message hash
+  (Definition 6, via Lemma 8).
+- Undetectability and preimage resistance for the chain hash
+  (Definitions 5 and 4).
 
-Requirements are Parameter Requirements 2 and 3 of [DKKW25] at
-`k_C = 128`, `k_Q = 64`, evaluated by `src/tests.rs` and equal to the
-output of [hashsig-parameters] for these inputs, rounded up to bytes as
-[hash-sig] rounds. `v = 36` is [hash-sig]'s 18-byte message hash; the
-bound alone allows 35, which no whole-byte truncation of the hash gives.
-Parameter Requirement 3 is stated for `L, v ≥ 2`; the `winternitz`
-instance at `L = 1` uses the `L = 2^8` widths, which meet every
-requirement at `L = 1` since each bound is non-decreasing in `log L`.
+These are assumptions on Keccak-256 with the exact input layouts and
+truncations in SPEC.md. The paper estimates these properties in the
+classical and quantum random-oracle models (Table 1). Applying those
+estimates to a concrete hash is a heuristic; the theorem does not prove
+this implementation's security.
 
-`T = 297` exceeds the mean nibble sum `270` by the factor `δ = 1.1` of
-[DKKW25, §8] and [hash-sig]'s `Off10` instantiations. By Lemma 7 the set
-of accepted vectors is incomparable, which replaces the Winternitz
-checksum, and its size is the coefficient `η_T` of `x^297` in
-`(1 + x + … + x^15)^36`, `2^137.20`, so a uniform digest is accepted with
-probability `2^-6.80`, once in 111 trials. By Lemma 3 the signer fails
-with probability `(1 − 2^-6.80)^K = e^-36.8` at `K = 2^12`, and then
-spends no leaf. By Lemma 8 the encoding's target collision resistance
-reduces to `T₂` below regardless of `T`, so `T` sets signer and verifier
-work only: 243 chain steps per verification.
+Chain starts, the public parameter and salt candidates are sampled
+through the OS random source. Its output must be suitable for independent
+uniform sampling. The implementation adds no PRF derivation; Remark 7's
+additional PRF assumption is therefore unnecessary. The random source,
+host and secret storage remain trusted.
 
-## 2. Model
+### Parameters
 
-Security is synchronized strong unforgeability, [DKKW25, Definition 8].
-The adversary receives `pk = (root, P)`, may query `Sig(ℓ, m)` at most
-once per leaf `ℓ`, and wins with `(ℓ*, m*, σ*)` such that `Ver` accepts
-and `(m*, σ*)` is not the pair returned for `ℓ*`. Queries to the hash are
-counted as `q`, classical or quantum; signing queries are classical and
-number `q_s ≤ L`. Theorem 5 charges the reduction `q' = q + pK` hash
-queries, `K` per signing query whether or not the signer's grinding stops
-early; the figures of §3 divide by this charged `t ≥ q + q_s K`, an
-accounting convention, not measured work.
+Parameter Requirements 2 and 3, equations (13)–(16), give the following
+minimum integer widths at `k_C = 128`, `k_Q = 64`, `w = 4`, `v = 36`,
+`L = q_s = 256` and `K = 4096`. Here `q_s` counts signing queries,
+including failed attempts.
 
-Outside the model, and treated in §6: replay of a valid signature, which
-the definition does not count as a forgery; more than one signature per
-leaf; keys that are not independently generated; loss or rollback of the
-signer's record; the quality of the random source.
+| Quantity | Required bits | Implemented bits | Equation |
+|---|---:|---:|---|
+| Message-hash output | 138 | 144 | (13) |
+| Salt | 168 | 168 | (14) |
+| Chain element / tree hash | 183 | 184 | (15) |
+| Public parameter | 142 | 144 | (16) |
 
-## 3. The bound
+The values are rounded up to whole bytes. The equations and agreement
+with the authors' pinned [parameter script] are checked in
+[src/tests.rs](src/tests.rs). These are the paper's security targets,
+not a separate concrete attack-cost estimate.
 
-[DKKW25, Theorem 1] with Corollary 2 gives for every adversary `A`
+Parameter Requirement 3 is stated for `L, v ≥ 2`. For `winternitz` at
+`L = 1`, the tree reduces to its leaf and the authentication path is
+empty. The implementation retains the `L = 256` widths and uses the
+same chain and leaf arguments with fewer targets. This is a
+specialization argument, not a direct application of that parameter
+requirement outside its stated range.
 
-```
-Adv(A) ≤ T₁ + T₂ + 2·T₃ + L·v·2^w · (2^w · T₅ + T₆)
-```
+### Target-sum encoding
 
-where the terms are advantages of reductions `B₁ … B₆` against the
-following properties, each with the number of targets shown. No
-pseudorandomness term appears: the chain starts and salts are sampled,
-which is the setting the theorem is stated in.
+Accepted vectors have 36 coordinates in `{0, …, 15}` with sum 297.
+Lemma 7 establishes their incomparability: if distinct `x` and `y`
+had `x_i ≤ y_i` for every coordinate, their sums could not be equal.
+This replaces the checksum in ordinary Winternitz encoding. Lemma 8
+reduces encoding collision resistance to the message-hash property.
 
-| Term | Property, [DKKW25] definition | Function | Targets |
-|---|---|---|---:|
-| `T₁` | multi-target collision resistance, Def. 3 | `Th`, tree tweaks | `2·L·v·2^w` |
-| `T₂` | target collision resistance with random sampling, Def. 6, `K` trials | `Th_msg` | `q_s` |
-| `T₃` | multi-target collision resistance, Def. 3 | `Th`, chain tweaks | `L·v·2^w` |
-| `T₅` | undetectability, Def. 5 | `Th`, chain tweaks | 1 |
-| `T₆` | preimage resistance, Def. 4 | `Th`, chain tweaks | 1 |
+For uniformly distributed message-hash outputs, acceptance probability
+is `p = η_297 / 2^144`, where `η_297` is the coefficient of `z^297` in
+`(1 + z + … + z^15)^36`. This gives about 111 salt candidates per
+success and exhaustion probability `(1−p)^4096 ≈ 9.0 × 10^−17`.
+More generally, Lemma 7 includes the hash's uniformity error, and
+Lemma 3 bounds signing failure by the encoding error raised to `K`.
+The coefficient is evaluated in the parameter test.
 
-Substituting the random-oracle bounds of [DKKW25, Table 1] with
-`|H_msg| = 2^144`, `|H| = 2^184`, `|R| = 2^168`, `|P| = 2^144`,
-`a_L = L·v·2^w = 147 456`, `p = q_s = 2^8`, `pK = 2^20`, and bounding every
-query count by `t`:
+One-use state is essential to the incomparability argument. After
+multiple signatures under one leaf, an observer can choose the earliest
+revealed position on each chain and walk forward from those positions.
+The combined values can reach encodings unavailable from any single
+signature. Never sign again under a spent leaf with another message or
+salt.
 
-```
-classical:  Adv/t ≤ 1/2^144 + 6/2^144 + pK/2^168 + (6 + a_L·(2^w + 2))/2^184
-                  ≤ 2^-144 + 2^-141.4 + 2^-148 + 2^-162.7  ≈ 2^-141.2
+### Keccak-256
 
-quantum:    Adv   ≤ α·t² + β·t + γ·√t,
-            α = 8/2^144 + 96/2^144 + (96 + 8·a_L)/2^184 ≈ 2^-137.3,
-            β = 12·a_L·(2^w + 1)/2^92 ≈ 2^-67.2,
-            γ = (3/2)·pK/2^84 ≈ 2^-63.4,
-            so Adv/t ≤ 2^-67.1 for 2^20 ≤ t ≤ 2^64 and ≤ 1/t beyond.
-```
+Keccak-256 and SHA3-256 use the same 24-round, 1600-bit permutation,
+1088-bit rate, 512-bit capacity and 256-bit output. Their suffixes
+differ: the delimited suffix is `0x01` for Keccak-256 and `0x06` for
+SHA3-256. See [FIPS 202] and the [Keccak specification]. They produce
+different digests and are distinct protocol instantiations.
 
-The `6/2^144` and `96/2^144` terms are the `2q/|P|` and `32q²/|P|` parts
-of the collision bounds, one for `T₁` and two for `T₃`: the classical
-level, 141 bits, is set by the parameter and digest widths together,
-both 144 bits as eqs. (13) and (16) require. The quantum level is the
-64-bit target, with 67 bits in the regime where the bound is not
-trivial; the `γ` term is why `t` is taken at or above `pK`, the charged
-cost of the signing queries.
+The shared permutation and sponge parameters motivate analogous
+security estimates. They do not establish equal concrete security or
+transfer a quantum random-oracle assumption between the functions.
+This implementation assumes the properties above for Keccak-256
+because verification uses Solana's Keccak syscall.
 
-Three things are outside the bound. The application's hash of its
-payload into the 32-byte message: a chosen-message collision on it costs
-`2^128` classically and about `2^85` quantumly, at and above the targets,
-and is A4's concern. The random source: the theorem takes uniform chain
-starts, `P` and salts as given, and A5 says where they come from. And
-the model itself: these are heuristic figures in the sense of the paper,
-the properties in the table being standard-model assumptions on
-Keccak-256 under these input layouts, estimated by Table 1 with the hash
-modelled as a random oracle.
+With the fixed formats in SPEC.md, chain, leaf, node and message inputs
+have distinct lengths: 48, 852, 70 and 76 bytes. Within each role,
+fixed-width tweaks distinguish positions. This argument must be
+revisited if the formats or parameters change.
 
-## 4. Differences from the paper and from hash-sig
+## Signer state
 
-What is not the paper's or hash-sig's, each treated below or in §6: the
-hash function (§4.1); lifetimes `2^0` and `2^8` with lengths recomputed
-from the authors' script, where hash-sig ships `2^18` and up; `K = 4096`,
-§8's parameter-setting assumption, where hash-sig allows 100 000; the
-wire formats, which carry the epoch inside the signature; and the
-signer's key file and lock (§6). Randomness is the paper's and not
-hash-sig's (§4.2).
+`SigningKey` persists each completed attempt before releasing a signature
+or sampling error. Exact retries use the recorded message and salt;
+a new attempt replaces the retry record, and sampling failure clears
+it. Persistence errors release no signature and require reopening the
+file. The record and lock protocol are specified in
+[SPEC.md](SPEC.md#persistent-signer).
 
-### 4.1 Keccak-256 for SHA3-256
+The operational requirements are:
 
-**Claim.** This is a Keccak-256 instantiation of the paper's generic
-construction. The reduction of Theorem 1 applies under the properties of
-§3 assumed for these Keccak-256 functions. Matching sponge parameters
-and related padding support analogous security estimates; they do not
-prove equal concrete classical or quantum security to SHA3-256, and the
-paper proves nothing about the concrete SHA3-256 functions either.
+- **One authoritative record.** Signers must share a host, trusted local
+  filesystem and the same key-file path, without aliases or independent
+  signing copies. The interoperability contract is Unix `flock`; the
+  TypeScript implementation uses Bun on macOS or Linux with glibc.
+- **A permanent lock inode.** Never unlink, rename or replace `.lock`.
+  Locking the key file itself would lose mutual exclusion when an update
+  replaces that file. The kernel releases the sidecar lock when its last
+  holder closes or dies; no stale-file deletion is needed for recovery.
+- **No rollback.** Preserve the complete current record. An old backup
+  can reuse a leaf, even if that leaf's transaction never landed.
+  `requireNextLeafAtLeast(lastAcceptedLeaf + 1)` checks a lower bound; it cannot detect
+  signatures exposed off-chain or make an old backup safe.
+- **Trusted storage.** Durability relies on the filesystem honoring
+  fsync and atomic rename. Format validation detects malformed records,
+  but does not authenticate them against malicious edits.
 
-**What is the same.** SHA3-256 [FIPS202] is `Keccak[c = 512](M ‖ 01)`;
-Keccak-256, Ethereum's and Solana's `sol_keccak256`, is
-`Keccak[c = 512](M)`, both under `pad10*1`. The permutation
-`Keccak-p[1600, 24]`, the 1088-bit rate, the 512-bit capacity and the
-256-bit output are identical; the suffix separates SHA3-256 from SHAKE,
-which is not used here. In the classical ideal-permutation model both
-are sponges with an admissible padding, and [BDPV08, Theorem 2] gives
-each the same indifferentiability loss `O(N²/2^512)` in permutation
-calls `N`. That model replaces the fixed permutation by a random one and
-says nothing about concrete security, and its bound does not carry to
-quantum queries: the quantum ideal-permutation result of [ACMT25,
-Theorem 7.22] is vacuous at this rate and capacity for `q = 2^64`, so the
-quantum figures of §3 rest on the QROM heuristic of Table 1 applied to
-Keccak-256, as the paper applies it to SHA3-256. The cryptanalytic record
-of §7.2.3 concerns the permutation and capacity and reads the same for
-both; the designers' argument that the suffix restricts Keccak's domain
-supports the suffixed function from the plain one, not the converse.
+Raw key constructors and `sign_at` / `signAt` bypass these protections.
+Their callers must provide independently sampled starts and `P` and
+manage one-use state themselves. The secret bytes alone are insufficient
+to recover signing state.
 
-**Why not SHA3-256 itself.** Solana has no SHA3-256 syscall. SHA3-256 in
-software on the SBPF target measures about 11,600 CU per call, and one
-verification makes 245 or 253 calls; both verifiers exhausted the
-1,400,000 CU transaction maximum (§8). The suffix cannot be produced
-through the Keccak-256 syscall, which appends its own padding.
+## Application responsibilities
 
-### 4.2 Sampled randomness
+Hash a canonical encoding of everything the application authorizes
+into the 32-byte message, including its domain and replay context.
+The prehash must be collision-resistant (Remark 1).
 
-Construction 3 Gen samples every chain start and `P`; Sig samples each
-salt candidate. The crate does exactly that, from the operating system's
-random source (`getrandom` in Rust, `randomFillSync` in TypeScript), and
-keeps the chain starts in the key file: 828 bytes for `winternitz`,
-211 968 for `xmss`. [hash-sig] instead derives chain starts and salt
-candidates from a 32-byte PRF key, which Remark 7 permits at the cost of
-an additive pseudorandomness term. That term is absent here, and so is a
-seed: the key file is the only copy of the key (A2), and two keys never
-share anything unless the random source repeats itself (A5). The
-message hash, chunking, chains, leaf, tree, public key and salt use are
-still [hash-sig]'s byte for byte, so a signature from [hash-sig] over
-its own chain starts verifies here, and given those chain starts and its
-salt is reproduced exactly.
+Verification is stateless. Retire a one-time key, or record accepted
+XMSS leaves, atomically with executing the authorized action. A strictly
+increasing leaf policy permits skipped leaves; a used-leaf set permits
+out-of-order acceptance. Requiring exactly the next leaf can block
+progress after a failed or abandoned signing attempt. The leaf index
+is a counter, unrelated to Solana slots or epochs.
 
-Signing draws salt candidates until one encodes to the target sum,
-records the accepted salt with the message and the next leaf, and only
-then computes the signature. Repeating the last message re-signs it with
-the recorded salt, so the same bytes are returned and no fresh
-randomness is drawn under a spent leaf. If all `K = 4096` candidates
-miss, once in e^36.8, nothing is recorded and no leaf is spent.
+## Implementation limits and evidence
 
-### 4.3 Domain separation
+Signing time depends on salt sampling. A fixed number of chain hashes
+for accepted signatures is not a constant-time guarantee. No complete
+side-channel assessment has been performed. Rust overwrites retained
+chain starts on drop; complete erasure of transient copies, including
+JavaScript heap copies, is not guaranteed. No tighter multi-user
+security bound is claimed here.
 
-Inputs are laid out as [DKKW25, §7.2] specifies: `P ‖ t ‖ x` with the
-domain byte of §7.1 first in every tweak, and `ρ ‖ P ‖ t ‖ m` for the
-message. Every role has its own fixed input length, 48, 852 and 70 bytes
-for chain steps, leaves and nodes and 76 for the message hash, so inputs
-of different roles are distinct strings whatever their content, and
-within a role the fixed-width tweak separates positions. The message
-input begins with the salt, which a forger chooses, exactly as in
-§7.2.1; the paper's own note applies, that no domain separation between
-the spaces of the two functions is added, and none of the reductions in
-§3 requires it. The argument is specific to these lengths; another
-parameter set needs its own.
+The tests check parameter equations, Keccak known answers, independent
+reference signatures, Rust/TypeScript signing agreement, mutations of
+fixtures, malformed records, failed randomness and persistence, retries,
+and process-death lock recovery. SBPF tests exercise syscall verification
+and measure compute units separately from CI. These checks support
+correctness for their inputs; they are not a security proof or an audit.
 
-## 5. Attacks considered
-
-| Attack | Requires | Classical | Quantum | Status |
-|---|---|---:|---:|---|
-| second preimage of one signed encoding | one signature | `2^144` | `2^72` | generic, §3 |
-| collision on `P`-dependent targets, the `2q/|P|` terms | one signature | `2^143` | `2^70` | §3, eq. (16) |
-| herding across `t` signed leaves | `t` signatures | none: sponge, [BDPV08]; `2^134.3` had the hash been SHA-256, §9 | | not applicable |
-| chain preimage or undetectability | one signature | `2^184` per target, `2^163` after the proof's `L·v·2^(2w)` loss; eq. (15) requires `2^151.5` | `2^67` in the `β` term of §3 | covered |
-| chain-start recovery from `pk` | public key | `2^184` preimages per chain, independent across chains | | covered |
-| leaf reuse, `k` signatures under one leaf | violation of A1 | table below | | outside the model |
-| multi-user forgery against `U` keys | `U` public keys | single-key cost `/ U` at most | | §7 |
-| rollback of the signer's record | violation of A2 | equals leaf reuse | | §6 |
-
-**Leaf reuse.** Let `x^(1), …, x^(k)` be the encodings signed under one
-leaf and `m_i = min_j x^(j)_i`. The revealed chain values reach every
-`x` with `x_i ≥ m_i` for all `i`, so a forger needs a salt whose encoding
-lies in `R(m) = { x ∈ [16]^36 : x ≥ m, Σ x_i = 297 }`, at
-`2^144 / |R(m)|` hash evaluations, using public signatures only.
-Measured on this crate at leaf 7 of one key:
-
-| `k` | `Σ m_i` | `log₂ |R(m)|` | cost | run |
-|---:|---:|---:|---:|---|
-| 1 | 297 | 0 | `2^144` | |
-| 2 | 219 | 91.3 | `2^52.7` | |
-| 3 | 153 | 115.6 | `2^28.4` | |
-| 4 | 120 | 122.7 | `2^21.3` | |
-| 8 | 58 | 132.3 | `2^11.7` | forged in 7 503 trials, accepted |
-| 16 | 31 | 134.8 | `2^9.2` | forged in 755 trials, accepted |
-
-The cost for `k = 2` depends on the pair; the earlier 35-chain
-instantiation measured `2^46.1` and `2^50.9` on two transcripts.
-
-## 6. Operational assumptions
-
-The model of §2 applies only if the following hold. Each names where the
-crate enforces it and what §5 says about its violation.
-
-- **A1, one message per leaf.** Enforced by `Signer`: the accepted salt,
-  the message and the next leaf are recorded on disk before a signature
-  is computed, the last message is repeated with its recorded salt
-  rather than re-signed, a different message on a spent leaf is refused,
-  a failed write makes the instance unusable until the file is reopened,
-  and one process holds a key file at a time through a kernel lock,
-  `flock`, on a permanent sidecar, the same call in both packages, so a
-  file held by one implementation is refused by the other and a dead
-  holder's lock is released by the kernel with no stale-owner decision
-  to race on (§9). Signers of one file share a host and a local
-  filesystem. `sign_at` bypasses all of this and is for tests. Violation:
-  leaf reuse, §5.
-- **A2, integrity of the signer's record.** The record holds `P`, the
-  next leaf, the last message with its salt, and every chain start; it is
-  the only copy of the key. A lost file is a lost key. A copy older than
-  the latest signature reintroduces A1's violation, which is not
-  detectable locally; a lower bound from the verifier's last accepted
-  leaf is checked by `floor`. Backups are of the record. Cf. [SP800-208,
-  §8] on state management.
-- **A3, verifier leaf policy.** The verifier retires leaves whose
-  signatures are public, since a signature stays valid until it does. A
-  strictly increasing leaf index retires every lower leaf on acceptance,
-  including any reused one; a used-leaf bitmap admits out-of-order
-  landing but retires only leaves that landed; requiring exactly the next
-  leaf leaves no way to skip a leaf whose message can no longer be
-  executed, so a changed message on that leaf is a reuse. The leaf index
-  is a counter and must not be derived from a slot or the Solana epoch.
-- **A4, message binding.** Everything the verifier acts upon is hashed
-  into the 32-byte `m` by the application, with a collision-resistant
-  hash as Remark 1 requires; `Keccak-256` of the payload is the natural
-  choice. Replay protection, for example a sequence number in the
-  payload, is the application's, as the model does not count replay as
-  forgery.
-- **A5, randomness.** Chain starts, `P` and salt candidates come from
-  the operating system's random source at key creation and at every
-  signature; the key is as secret as that source is unpredictable. Keys
-  are independent because they are independent samples.
-
-## 7. Open problems and limitations
-
-- The properties of Keccak-256 in §3 under these input layouts, at
-  184-bit truncation, are assumed, not proven; the paper's SHA3-256
-  instantiation carries the same caveat.
-- The random source is trusted (A5); its output is not tested for
-  quality, only for length.
-- Multi-user security is bounded only by the generic `log₂ U` loss.
-- Signing time varies through the number of salt candidates tried; it
-  reveals that number and nothing else. Chain starts are overwritten
-  when keys and signers are dropped; transient stack copies are not.
-- Correctness with these constants is argued for `T = 297`; other targets
-  change `η_T` and the required `K`.
-- Mutual exclusion between the two signer implementations is checked
-  outside CI (§8).
-
-## 8. Verification record
-
-Mechanically checked in the repository: eqs. (13) to (16) and `η_T`
-(`src/tests.rs`); Keccak-256 against the known answers for the empty
-string and `"abc"`, which SHA3-256 does not share; the SBPF syscall
-number; signatures produced by [hash-sig] at commit `e66a485` with its
-hash swapped to Keccak-256, at these exact type parameters, verified
-here (`tests/hash-sig.json`); signing from explicit chain starts and
-salts reproduced by two implementations sharing no code
-(`tests/sampled.json`, `tests/winternitz.key`); every single-byte change
-to a signature, key or message rejected; a key file whose record
-contradicts itself refused; the SBPF verifier under Mollusk against
-host-generated signatures, 34 331 and 35 971 CU; in both packages, a key
-file held by another process refused and opened once that process is
-killed; in both packages, a failed random source, salt exhaustion and a
-failed write releasing no signature and spending no leaf, and the
-recorded message re-signed without drawing randomness.
-
-Checked outside CI through the public APIs: each package refuses a key
-file the other holds, in both acquisition orders, and opens it once the
-other side is killed. Reproduced in this analysis: the leaf-reuse
-forgeries of §5 at full parameters, accepted by the verifier; software
-SHA3-256 on the SBPF target exhausting 1 400 000 CU in one verification,
-12 454 CU for the single message hash of a rejected signature.
-
-## 9. Alternatives considered
-
-SHA-256, with its cheaper appearance on Solana: rejected. Every hash
-syscall costs the same 85 CU plus `max(10, len/2)` per slice, and the
-plain Merkle–Damgård message hash admits herding across signed leaves at
-about `2^134.3` [PKC22, KK06], reproduced at reduced parameters before
-this instantiation was chosen; HMAC closes it at the price of leaving
-§7.2. SHA3-256 in software on-chain: rejected by measurement, §4.1.
-35 chains, the minimum of eq. (13): rejected, 4 bits of digest that the
-reference implementation cannot express and 7 fewer chain steps.
-Chain starts and salts from a seed through [hash-sig]'s PRF: adopted for
-a time, then replaced by the paper's sampling; it rebuilt [hash-sig]'s
-keys byte for byte from their PRF keys, but added the pseudorandomness
-assumption of Remark 7, made the two instances built from one seed share
-leaf 0, and put a 32-byte seed rather than the record at the centre of
-backups. Messages of any length hashed inside `Th_msg`: rejected in
-favour of the paper's fixed length; the salted `2^144` bound on the
-message becomes the application's `2^128` collision bound on its payload
-hash, the paper's own arrangement. A pid file for the lock, created
-exclusively, with a dead owner's file cleared by the next opener:
-rejected, two openers clearing at once let the slower one remove the
-faster one's fresh lock, reproduced through the public APIs; without an
-atomic compare-and-remove no userspace recovery is race-free, and
-without recovery a crash needs a hand-removed file. The kernel lock has
-neither problem; its price is that the TypeScript signer reaches `flock`
-through Bun's FFI, since Node exposes no file lock. Classical Winternitz
-with checksum chains, Construction 5: more chains and variable verifier
-work. Resuming a restored record at a margin above the verifier's last
-accepted leaf: rejected, a guess (A2).
-
-## References
-
-- [DKKW25] J. Drake, D. Khovratovich, M. Kudinov, B. Wagner. Hash-Based
-  Multi-Signatures for Post-Quantum Ethereum. IACR CiC 2025.
-  https://eprint.iacr.org/2025/055
-- [hash-sig] https://github.com/b-wagn/hash-sig, the reference
-  implementation of [DKKW25]; commit `e66a485`.
-- [hashsig-parameters] https://github.com/b-wagn/hashsig-parameters,
-  the parameter script of [DKKW25].
-- [FIPS202] SHA-3 Standard: Permutation-Based Hash and Extendable-Output
-  Functions. NIST, 2015.
-- [BDPV08] G. Bertoni, J. Daemen, M. Peeters, G. Van Assche. On the
-  Indifferentiability of the Sponge Construction. EUROCRYPT 2008.
-- [ACMT25] G. Alagic, J. Carolan, C. Majenz, S. Tokat. The Sponge is
-  Quantum Indifferentiable. arXiv:2504.16887, 2025.
-- [PKC22] R. Perlner, J. Kelsey, D. Cooper. Breaking Category Five
-  SPHINCS+ with SHA-256. PQCrypto 2022. https://eprint.iacr.org/2022/1061
-- [KK06] J. Kelsey, T. Kohno. Herding Hash Functions and the Nostradamus
-  Attack. EUROCRYPT 2006.
-- [SP800-208] Recommendation for Stateful Hash-Based Signature Schemes.
-  NIST, 2020.
+[DKKW25]: https://eprint.iacr.org/2025/055
+[parameter script]: https://github.com/b-wagn/hashsig-parameters/blob/95a80bcd3ac73f67d9a322a83b2b6819d36a5c66/lower_bounds.py
+[FIPS 202]: https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.202.pdf
+[Keccak specification]: https://keccak.team/keccak_specs_summary.html

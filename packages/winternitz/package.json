@@ -10,10 +10,22 @@
     ".": {
       "types": "./dist/src/index.d.ts",
       "default": "./dist/src/index.js"
+    },
+    "./signer": {
+      "types": "./dist/src/signer.d.ts",
+      "default": "./dist/src/signer.js"
+    },
+    "./hazmat": {
+      "types": "./dist/src/hazmat.d.ts",
+      "default": "./dist/src/hazmat.js"
     }
   },
-  "files": ["dist/src"],
-  "scripts": { "build": "tsc -b" },
+  "files": [
+    "dist/src"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
   "dependencies": {
     "@noble/hashes": "^2.4.0"
   }

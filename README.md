@@ -3,159 +3,143 @@
 [![CI](https://github.com/blueshift-gg/solana-winternitz/actions/workflows/ci.yml/badge.svg)](https://github.com/blueshift-gg/solana-winternitz/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/blueshift-gg/solana-winternitz/blob/main/LICENSE)
 
-Post-quantum hash-based signatures for Solana programs, verified with the
-`sol_keccak256` syscall alone: generalized XMSS over target-sum
-Winternitz, Constructions 3 and 6 of
-[Drake, Khovratovich, Kudinov and Wagner, IACR CiC 2025](https://eprint.iacr.org/2025/055),
-in the paper's SHA-3 instantiation (§7.2) at its §8 operating point, with
-the parameters and 32-byte messages of the authors' implementation
-[hash-sig](https://github.com/b-wagn/hash-sig), and with chain starts,
-parameter and salts sampled as the paper writes them. Keccak-256 stands
-in for SHA3-256, the one substitution the platform forces; with that
-substitution, hash-sig's signatures verify here. The security level is
-the paper's 128 bits classical and 64 bits quantum (Corollary 2,
-Parameter Requirements 2 and 3). Research code, not audited.
+Generalized XMSS with target-sum Winternitz encoding, instantiated with
+Keccak-256: Constructions 3 and 6 of
+[Drake, Khovratovich, Kudinov and Wagner (DKKW25)](https://eprint.iacr.org/2025/055).
+Verification uses Solana's `sol_keccak256` syscall. Signing is stateful:
+each leaf permits one signing attempt, including failed salt sampling.
 
-| Instance | Signatures per key | Signature | Public key | Verify CU |
+Experimental; no independent security audit. The target is 128-bit
+classical and 64-bit quantum security under the assumptions in
+[SECURITY.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SECURITY.md).
+This is a Keccak-256 instantiation of the construction, with locally
+chosen lifetimes and persistent signer state. The byte formats and
+relationship to the paper are specified in
+[SPEC.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SPEC.md).
+
+| Instance | Leaves per key | Signature | Public key | Verify CU |
 |---|---:|---:|---:|---:|
-| `winternitz` | 1 | 849 B | 41 B | 34,331 |
-| `xmss` | 256, one per leaf | 1,037 B | 41 B | 35,971 |
+| `winternitz` | 1 | 849 B | 41 B | 34,371 |
+| `xmss` | 256 | 1,037 B | 41 B | 36,012 |
 
-`winternitz` is the tree of height 0, `xmss` the tree of height 8; one
-code path serves both. Verification is constant work: one message hash,
-243 chain steps, one leaf hash, one node hash per tree level.
+Accepted signatures require one message hash, 243 chain steps, one leaf
+hash and, for `xmss`, eight node hashes. CU figures are fixture
+measurements under Mollusk with platform-tools v1.56; reproduce them
+with the SBPF test below.
 
-- [SPEC.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SPEC.md):
-  every byte from seed to signature, the key file and its lock, the
-  vectors, and what differs from the paper and from hash-sig.
-- [SECURITY.md](https://github.com/blueshift-gg/solana-winternitz/blob/main/SECURITY.md):
-  the claim, the model, the bound at these parameters, the assumptions
-  behind it, and what is not proven.
-
-## Verify on-chain
+## Verify
 
 ```toml
 [dependencies]
 solana-winternitz = "0.1"
 ```
 
-```rust,ignore
-use solana_winternitz::{PublicKey, winternitz, xmss};
+Given a stored public key, a 32-byte message digest and signature bytes:
 
-let message: [u8; 32] = keccak256(payload); // the program hashes what it acts on
+```rust
+# fn verify(public_key: [u8; 41], message: [u8; 32], signature: [u8; 1037]) -> Result<(), solana_winternitz::Error> {
+use solana_winternitz::{VerifyingKey, xmss};
 
-winternitz::Signature(signature_bytes).verify(&PublicKey(stored), &message)?;
-
-let sig = xmss::Signature(signature_bytes);
-if sig.leaf() <= last_leaf { return Err(...) } // the program's leaf policy, see SECURITY.md
-sig.verify(&PublicKey(stored), &message)?;
-last_leaf = sig.leaf(); // in the same instruction
+let public_key = VerifyingKey::from_bytes(&public_key);
+let signature = xmss::Signature::from_bytes(&signature);
+public_key.verify(&message, &signature)?;
+# Ok(())
+# }
 ```
 
-A message is a 32-byte digest, the paper's fixed message length and
-hash-sig's: the program hashes whatever it acts on, with `sol_keccak256`
-or any collision-resistant hash, and passes the digest. The crate is
-`no_std` with no on-chain dependencies. `verify` returns
-`Err(Error::InvalidSignature)` for any failure, with no distinction
-between a wrong message, a wrong key and corrupted bytes.
+Pass a `winternitz::Signature` to the same key method for the one-leaf
+instance. The digest argument is `&[u8; MESSAGE_LEN]`, and
+verification returns `Error::InvalidSignature` on failure. These are inherent
+methods with no trait imports. The crate is `no_std` and has no dependencies
+on Solana.
 
-## Sign off-chain
+The application hashes everything it authorizes into the message and
+enforces replay protection atomically with execution. For `winternitz`,
+retire the key after acceptance. For `xmss`, `signature.leaf()` gives the
+leaf index for the application's replay policy. It is a counter,
+unrelated to Solana slots or epochs.
+
+## Sign
 
 ```sh
-bun add @blueshift-gg/solana-winternitz
+bun add @blueshift-gg/solana-winternitz @noble/hashes
 ```
 
 ```ts
 import { keccak_256 } from '@noble/hashes/sha3.js';
-import { Signer, winternitz, xmss } from '@blueshift-gg/solana-winternitz';
+import { xmss } from '@blueshift-gg/solana-winternitz/signer';
 
-const signer = Signer.create(xmss.SecretKey, 'tree.key'); // samples the key, ~1 s: builds 256 leaves
-const treeKey = signer.publicKey; // 41 bytes, register on-chain
-const message = keccak_256(payload); // the digest the program will compute
-const signature = signer.sign(message); // spends leaf 0, recorded in the file first
-signer.sign(message); // the same message again: same bytes, no leaf spent
-signer.close();
-
-const again = Signer.open(xmss.SecretKey, 'tree.key').floor(lastAcceptedOnChain + 1);
-const once = Signer.create(winternitz.SecretKey, 'once.key'); // one leaf
+using signer = xmss.SigningKey.create('tree.key');
+const message = keccak_256(new TextEncoder().encode('example'));
+const publicKey = signer.verifyingKey();
+const signature = signer.sign(message);
+publicKey.verify(message, signature);
 ```
 
-The same `Signer` exists in Rust behind the `sign` feature, with
-`create`, `open`, `floor`, `sign`, `public_key`, `next_leaf` and
-`remaining`. The two read each other's key files and honour each other's
-locks. `create` samples every chain start and the parameter from the
-operating system's random source, as the paper's key generation does,
-and refuses an existing file; `open` takes only a file. The key file is
-the key and its only copy: the chain starts, the parameter, the next
-leaf, and the last message with its salt, 906 bytes for `winternitz` and
-212,046 for `xmss`. Back up the file. One process holds a file at a
-time, through a kernel lock on a permanent `.lock` sidecar that the OS
-releases if the holder dies. The TypeScript signer needs Bun on a unix
-host for that call; verification and key generation run anywhere.
-`signAt` and `sign_at` sign under an explicit leaf with a given salt and
-record nothing; they exist for tests and vectors.
+`create` samples the key from the OS random source and refuses an
+existing file. Resume with `xmss.SigningKey.open('tree.key')`.
+The recorded message can be retried with the same signature bytes,
+including after reopening. A new attempt replaces that retry record;
+sampling failure also spends its leaf.
 
-## Rules
+Rust provides `xmss::SigningKey::create("tree.key")` and
+`winternitz::SigningKey::create("once.key")` with the `sign` feature.
+Both implementations share a key-file format and Unix kernel locks.
+The TypeScript signer requires Bun on macOS or Linux with glibc;
+the pure package root also runs in browsers, workers and Node. See the
+[package README](https://github.com/blueshift-gg/solana-winternitz/blob/main/packages/winternitz/README.md)
+for API details.
 
-- Put everything the program will act on in the payload it hashes into
-  the message. The scheme binds that digest, not the transaction around
-  it.
-- `winternitz`: one message per seed, and the program retires the key in
-  the instruction that verifies.
-- `xmss`: never two messages under one leaf. `Signer` enforces it on the
-  device; the program enforces a leaf policy on the index. A signature
-  that reached any RPC has spent its leaf, landed or not.
-- A leaf index is a counter, the paper's epoch. Never derive it from a
-  slot or the Solana epoch.
+The key file contains secrets and usage state. Keep one authoritative
+copy, on a trusted local filesystem, accessed through the same path.
+Never restore an older signing state or remove its permanent `.lock`
+sidecar. A signature spends its leaf even if its transaction never lands.
+The `hazmat` module (`./hazmat` in TypeScript) provides caller-managed key
+generation and leaf signing. It does not manage usage state.
 
-## Parameters
+```rust
+# #[cfg(feature = "sign")]
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use solana_winternitz::{hazmat::winternitz::SecretKey, SigningError};
 
-| Parameter | Value | Source |
-|---|---:|---|
-| Chains `v` | 36 | hash-sig's 18-byte message hash: 144 bits ≥ 138, eq. (13) |
-| Chain positions `2^w` | 16 | one nibble per chain |
-| Target sum `T` | 297 | `δ = 1.1`, §8: 243 verifier steps, ~111 salts per signature |
-| Salt trials `K` | 4096 | §8; all miss once in e^36.8 |
-| Chain element `n` | 23 B | ≥ 183 bits at lifetime 2^8, eq. (15) |
-| Public parameter `P` | 18 B | ≥ 142 bits, eq. (16) |
-| Salt `ρ` | 21 B | ≥ 168 bits at lifetime 2^8 with 4096 trials, eq. (14) |
-| Message | 32 B | hash-sig's `MESSAGE_LENGTH`, the paper's fixed `l_msg` |
-| Tree height | 0 or 8 | 1 or 256 leaves |
+let fill = |out: &mut [u8]| getrandom::fill(out).map_err(SigningError::Random);
+let secret = SecretKey::generate(fill)?;
+let digest = [0u8; 32]; // Replace with the application's message digest.
+// This fresh one-leaf key is used once and discarded, including on failure.
+let signature = secret.sign_at(0, &digest, fill)?;
+secret.verifying_key().verify(&digest, &signature)?;
+# Ok(())
+# }
+# #[cfg(not(feature = "sign"))]
+# fn main() {}
+```
 
-The lengths are what the authors'
-[parameter script](https://github.com/b-wagn/hashsig-parameters) prints
-for these inputs, rounded up to bytes as hash-sig does; the tests pin
-the bounds. At lifetime 2^18 hash-sig's own SHA-3 instantiation has the
-same `v`, `w`, `P` and `δ`, with longer chain elements and salts for the
-longer lifetime.
+If the key survives a call, reserve and persist the leaf before calling `sign_at`,
+including attempts that fail. `sign_at_with_salt` on `hazmat::OneTime` reproduces a
+signature from a recorded accepted salt without sampling or allocating a leaf.
 
-## Tests
+## Validation
 
-`cargo test --lib` pins the four parameter bounds, Keccak-256 against its
-known answers, the syscall id, hash-sig's signatures in
-[`tests/hash-sig.json`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/hash-sig.json)
-verifying, signing from explicit chain starts and salts against
-[`tests/sampled.json`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/sampled.json)
-and the key file
-[`tests/winternitz.key`](https://github.com/blueshift-gg/solana-winternitz/blob/main/tests/winternitz.key),
-rejection of every single-byte tamper, the signer's rules, and its lock
-dying with its holder. The TypeScript package is a second implementation
-written from `SPEC.md`, sharing no code, that must reproduce the same
-fixtures and additionally checks that a failed random source, salt
-exhaustion and a failed write release no signature. `tests/sbpf.rs`
-measures the verifiers as SBPF programs under Mollusk and needs
-`cargo build-sbf`.
+The tests check parameter bounds, sampled-input signing agreement
+between Rust and TypeScript, independent reference signatures, tampered
+fixtures, and signer failure and recovery behavior.
 
 ```sh
 cargo test --lib
+cargo test --doc --features sign
 cargo +nightly fmt --all -- --check
 cargo +nightly clippy --all-targets --features sign -- -D warnings
-cargo test --test sbpf -- --nocapture --test-threads=1
 bun install --frozen-lockfile
 bun run test
 ```
 
+SBPF correctness and CU measurements require `cargo build-sbf` and run
+separately from CI:
+
+```sh
+cargo test --test sbpf -- --nocapture --test-threads=1
+```
+
 ## License
 
-MIT. Provided as-is; review it against your own threat model before using
-it to secure value.
+[MIT](https://github.com/blueshift-gg/solana-winternitz/blob/main/LICENSE).

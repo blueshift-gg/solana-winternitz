@@ -38,8 +38,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Lib unit tests only. `tests/sbpf.rs` needs `cargo build-sbf` and
-      # measures compute units; it is not a correctness gate.
+      # SBPF correctness and CU tests run separately; they need cargo build-sbf.
       - run: cargo test --lib
 
   typescript:

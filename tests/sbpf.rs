@@ -1,14 +1,13 @@
-//! Compute units of both verifiers as SBPF programs under Mollusk (needs
-//! `cargo build-sbf`). Vector 1 of each corpus in `tests/vectors.json`.
+//! SBPF verification and CU measurements under Mollusk; needs `cargo build-sbf`.
 use core::hint::black_box;
-use solana_winternitz::{PublicKey, winternitz, xmss};
+use solana_winternitz::{VerifyingKey, winternitz, xmss};
 use svm_unit_test::svm_test;
 
 const MESSAGE: [u8; 32] = [
     0x2a, 0x32, 0x5d, 0xe5, 0xc3, 0x08, 0x46, 0xf9, 0x59, 0x8e, 0x4d, 0x83, 0xb9, 0xb0, 0xed, 0x8e,
     0xce, 0xd9, 0x45, 0xe5, 0x97, 0x95, 0x00, 0xf5, 0x28, 0x0c, 0xee, 0x9c, 0xc9, 0x48, 0x4a, 0xfd,
 ];
-/// Vector 0's message; `vectors_are_reproduced` pins that vector 1 rejects it.
+/// A message whose encoding is off target under the fixture salt.
 const OTHER: [u8; 32] = [0; 32];
 const WINTERNITZ_KEY: [u8; 41] = [
     0xcc, 0x8d, 0xc9, 0x25, 0x81, 0x10, 0xd9, 0x49, 0xd5, 0xda, 0xd7, 0xec, 0x11, 0x53, 0x7b, 0x29,
@@ -149,25 +148,31 @@ const XMSS_SIGNATURE: [u8; 1037] = [
 
 #[svm_test]
 fn winternitz_verify() {
-    let out = black_box(&winternitz::Signature(SIGNATURE))
-        .verify(black_box(&PublicKey(WINTERNITZ_KEY)), black_box(&MESSAGE));
+    let out = black_box(&VerifyingKey::from_bytes(&WINTERNITZ_KEY)).verify(
+        black_box(&MESSAGE),
+        black_box(&winternitz::Signature::from_bytes(&SIGNATURE)),
+    );
     assert!(out.is_ok());
     let _ = black_box(out);
 }
 
 #[svm_test]
 fn xmss_verify() {
-    let out = black_box(&xmss::Signature(XMSS_SIGNATURE))
-        .verify(black_box(&PublicKey(XMSS_KEY)), black_box(&MESSAGE));
+    let out = black_box(&VerifyingKey::from_bytes(&XMSS_KEY)).verify(
+        black_box(&MESSAGE),
+        black_box(&xmss::Signature::from_bytes(&XMSS_SIGNATURE)),
+    );
     assert!(out.is_ok());
     let _ = black_box(out);
 }
 
-/// Wrong message: rejected at the encoding, before any chain hash.
+/// This fixture rejects at the encoding, before any chain hash.
 #[svm_test]
 fn reject_off_target() {
-    let out = black_box(&winternitz::Signature(SIGNATURE))
-        .verify(black_box(&PublicKey(WINTERNITZ_KEY)), black_box(&OTHER));
+    let out = black_box(&VerifyingKey::from_bytes(&WINTERNITZ_KEY)).verify(
+        black_box(&OTHER),
+        black_box(&winternitz::Signature::from_bytes(&SIGNATURE)),
+    );
     assert!(out.is_err());
     let _ = black_box(out);
 }

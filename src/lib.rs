@@ -1,13 +1,4 @@
 #![doc = include_str!("../README.md")]
-//!
-//! # Reading the source
-//!
-//! The construction is [DKKW25] Construction 3 over Construction 6 with the
-//! §7.2 instantiation and the parameters of the authors' implementation,
-//! hash-sig, Keccak-256 standing in for SHA3-256 (`hash.rs`). Chain
-//! starts, the parameter and salts are sampled as Construction 3 writes
-//! them (`signing`, `signer`). On `target_os = "solana"` every hash is the
-//! `sol_keccak256` syscall.
 #![no_std]
 #![deny(missing_docs, clippy::undocumented_unsafe_blocks)]
 
@@ -21,28 +12,26 @@ extern crate std;
 #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
 mod signer;
 #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
-pub use signer::{OneTime, Signer, SignerError};
+pub use signer::{SigningError, SigningKey};
+
+#[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
+pub mod hazmat;
 
 #[cfg(test)]
 mod tests;
 
-/// `v`: hash-sig's 18-byte message hash at w = 4, 36 × 4 = 144 bits ≥ 138,
-/// eq. (13). The bound alone allows 35, which no whole-byte truncation
-/// gives.
+/// `v`: 36 four-bit digits from an 18-byte hash; ≥ 138 bits, DKKW25 eq. (13).
 const CHAINS: usize = 36;
 /// `2^w`, w = 4.
 const POSITIONS: u8 = 16;
-/// `T = ⌈δ·v(2^w − 1)/2⌉` at δ = 1.1, the paper's §8 operating point and
-/// hash-sig's `Off10`: 36·15 − 297 = 243 verifier steps, one salt in ~111
-/// accepted (Lemma 7's `η_T`). Security is the digest width, not `T`:
-/// Lemma 8, eq. (13).
+/// `T = ⌈1.1·v(2^w − 1)/2⌉` (§8): 243 verifier chain steps.
+/// Equal-sum vectors are incomparable (Lemma 7), replacing the checksum.
 const TARGET_SUM: u16 = 297;
 /// `ρ`: eq. (14) at L = 2^8, K = 2^12 needs ≥ 168 bits.
 const SALT_LENGTH: usize = 21;
 /// `P`: eq. (16) needs ≥ 142 bits.
-const PARAMETER_LENGTH: usize = 18;
-/// `n`, chain elements, leaves and nodes alike: eq. (15) at L = 2^8 needs
-/// ≥ 183 bits.
+pub const PARAMETER_LEN: usize = 18;
+/// Chain elements, leaves and nodes: eq. (15) at L = 2^8 needs ≥ 183 bits.
 const ELEMENT_LENGTH: usize = 23;
 const ELEMENTS_LENGTH: usize = CHAINS * ELEMENT_LENGTH;
 
@@ -56,27 +45,90 @@ const CHAIN_TWEAK_LENGTH: usize = 7;
 const TREE_TWEAK_LENGTH: usize = 6;
 
 /// `pk = (root, P)` of Construction 3; the root is the leaf at height 0.
-pub const PUBLIC_KEY_LENGTH: usize = ELEMENT_LENGTH + PARAMETER_LENGTH;
-/// `l_msg`, as hash-sig's `MESSAGE_LENGTH`: a message is a 32-byte digest,
-/// the caller's hash of whatever it acts on (Remark 1).
-pub const MESSAGE_LENGTH: usize = 32;
+pub const PUBLIC_KEY_LEN: usize = ELEMENT_LENGTH + PARAMETER_LEN;
+/// Application-supplied digest length in bytes (Remark 1).
+pub const MESSAGE_LEN: usize = 32;
 
-/// The one verification error: the verifier does not say why.
+/// Signature verification failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The salted digest misses the target sum, the leaf is out of range,
     /// or the chains do not close on the public key.
     InvalidSignature,
+    /// An encoded value has the wrong length.
+    InvalidLength,
 }
 
-/// `root ‖ P`, 41 bytes: what a program stores.
+/// `root ‖ P`, 41 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PublicKey(pub [u8; PUBLIC_KEY_LENGTH]);
+#[repr(transparent)]
+pub struct VerifyingKey(pub(crate) [u8; PUBLIC_KEY_LEN]);
 
-impl PublicKey {
+impl VerifyingKey {
+    /// Verify a Winternitz or XMSS signature over an application-supplied 32-byte digest.
+    /// The signature type selects the instance. Records no replay or usage state.
+    pub fn verify(
+        &self,
+        digest: &[u8; MESSAGE_LEN],
+        signature: &impl sealed::Signature,
+    ) -> Result<(), Error> {
+        signature.verify_digest(self, digest)
+    }
+
+    /// Length of the fixed encoding, in bytes.
+    pub const BYTE_LEN: usize = PUBLIC_KEY_LEN;
+
+    /// Decode a fixed-size encoding. Signature validity is checked by verification.
+    #[inline(always)]
+    pub const fn from_bytes(bytes: &[u8; PUBLIC_KEY_LEN]) -> Self {
+        Self(*bytes)
+    }
+
+    /// Copy an encoding after checking its exact length.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(Self::from_bytes(
+            bytes.try_into().map_err(|_| Error::InvalidLength)?,
+        ))
+    }
+
+    /// Borrow an encoding without copying after checking its exact length.
+    pub fn ref_from_bytes(bytes: &[u8]) -> Result<&Self, Error> {
+        let bytes: &[u8; PUBLIC_KEY_LEN] = bytes.try_into().map_err(|_| Error::InvalidLength)?;
+        // SAFETY: transparent wrapper around this byte array; alignment is one.
+        Ok(unsafe { &*(bytes as *const [u8; PUBLIC_KEY_LEN] as *const Self) })
+    }
+
+    /// Borrow the encoded bytes.
+    pub const fn as_bytes(&self) -> &[u8; PUBLIC_KEY_LEN] {
+        &self.0
+    }
+    /// Copy the encoded bytes.
+    pub const fn to_bytes(&self) -> [u8; PUBLIC_KEY_LEN] {
+        self.0
+    }
+    /// Consume this value and return its encoding.
+    pub const fn into_bytes(self) -> [u8; PUBLIC_KEY_LEN] {
+        self.0
+    }
+}
+
+impl TryFrom<&[u8]> for VerifyingKey {
+    type Error = Error;
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        Self::from_slice(bytes)
+    }
+}
+
+impl AsRef<[u8]> for VerifyingKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl VerifyingKey {
     #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
     fn new(node: &[u8; ELEMENT_LENGTH], parameter: &[u8]) -> Self {
-        let mut pk = [0; PUBLIC_KEY_LENGTH];
+        let mut pk = [0; PUBLIC_KEY_LEN];
         pk[..ELEMENT_LENGTH].copy_from_slice(node);
         pk[ELEMENT_LENGTH..].copy_from_slice(parameter);
         Self(pk)
@@ -93,8 +145,7 @@ impl PublicKey {
     }
 }
 
-/// Overwrite secret bytes on drop. Volatile writes and a fence so the
-/// compiler cannot elide the store into a value it considers dead.
+/// Overwrite this buffer without dead-store elimination; other copies may remain.
 #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
 fn wipe(bytes: &mut [u8]) {
     for byte in bytes {
@@ -104,15 +155,13 @@ fn wipe(bytes: &mut [u8]) {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
-/// Construction 6 over §7.2.1's `Th_msg(P, T, M, R) = Trunc(H(R ‖ P ‖ T ‖ M))`:
-/// the first `v·w` bits as `v` chunks of `w` bits, accepted iff they sum to
-/// `T`. Byte for byte hash-sig's `ShaMessageHash`: the epoch little-endian
-/// in this one tweak, chunks low nibble first.
+/// Construction 6: accept the 36 low-first nibbles iff their sum is `T`.
+/// The message tweak alone uses a little-endian leaf index, as in hash-sig.
 fn encode(
     salt: &[u8],
     parameter: &[u8],
     leaf: u32,
-    message: &[u8; MESSAGE_LENGTH],
+    message: &[u8; MESSAGE_LEN],
 ) -> Option<[u8; CHAINS]> {
     let mut tweak = [ROLE_MESSAGE, 0, 0, 0, 0];
     tweak[1..].copy_from_slice(&leaf.to_le_bytes());
@@ -124,12 +173,12 @@ fn encode(
     (x.iter().map(|&v| u16::from(v)).sum::<u16>() == TARGET_SUM).then_some(x)
 }
 
-/// Construction 2's chain over §7.2.2's `Th(P, T, M) = Trunc_n(H(P ‖ T ‖ M))`,
-/// laid out as one 48-byte buffer: each step is one syscall.
+/// Construction 2 over `Trunc_n(H(P ‖ t ‖ x))` (§7.2.2).
+/// One 48-byte buffer keeps each chain syscall to a single slice.
 struct Chain([u8; Chain::VALUE + ELEMENT_LENGTH]);
 
 impl Chain {
-    const TWEAK: usize = PARAMETER_LENGTH;
+    const TWEAK: usize = PARAMETER_LEN;
     const INDEX: usize = Self::TWEAK + 5;
     const POSITION: usize = Self::TWEAK + 6;
     const VALUE: usize = Self::TWEAK + CHAIN_TWEAK_LENGTH;
@@ -142,9 +191,8 @@ impl Chain {
         Self(buf)
     }
 
-    /// Construction 2: the step into position `k` carries tweak `k`, as
-    /// hash-sig's `chain`. Lemma 2 is why signer and verifier may split
-    /// the walk at `x_i`.
+    /// The step entering position `k` uses tweak `k` (Construction 2).
+    /// Lemma 2 permits splitting the walk at the signed position `x_i`.
     fn walk(&mut self, i: u8, from: u8, to: u8, x: &[u8; ELEMENT_LENGTH]) -> [u8; ELEMENT_LENGTH] {
         self.0[Self::INDEX] = i;
         self.0[Self::VALUE..].copy_from_slice(x);
@@ -177,9 +225,7 @@ fn tree_tweak(level: u8, index: u32) -> [u8; TREE_TWEAK_LENGTH] {
     tweak
 }
 
-/// Construction 1 leaf, `Th(P, tweakmt(0, i), pk_i)`, `pk_i` the 36 chain
-/// ends of Construction 3. The ends are contiguous and go to the syscall
-/// uncopied.
+/// Construction 1 leaf: hash the 36 chain ends without copying them.
 fn leaf_hash(
     parameter: &[u8],
     leaf: u32,
@@ -208,7 +254,7 @@ fn node(
 mod signing {
     use super::*;
 
-    /// `K` of Construction 3; salt candidates are sampled independently.
+    /// `K` of Construction 3. Lemma 3 bounds failure by encoding error raised to `K`.
     pub const MAX_TRIALS: u32 = 4096;
 
     pub fn ends(secrets: &[u8], parameter: &[u8], leaf: u32) -> [[u8; ELEMENT_LENGTH]; CHAINS] {
@@ -230,7 +276,7 @@ mod signing {
         secrets: &[u8],
         parameter: &[u8],
         leaf: u32,
-        message: &[u8; MESSAGE_LENGTH],
+        message: &[u8; MESSAGE_LEN],
         salt: &[u8; SALT_LENGTH],
     ) -> Option<[u8; ELEMENTS_LENGTH]> {
         let x = encode(salt, parameter, leaf, message)?;
@@ -252,4 +298,27 @@ mod signing {
         }
         Some(elements)
     }
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidLength => "invalid encoded value or digest length",
+            Self::InvalidSignature => "invalid signature",
+        })
+    }
+}
+impl core::error::Error for Error {}
+
+// Closed dispatch for the two supported signature encodings and key-file tags.
+mod sealed {
+    pub trait Signature {
+        fn verify_digest(
+            &self,
+            key: &super::VerifyingKey,
+            digest: &[u8; super::MESSAGE_LEN],
+        ) -> Result<(), super::Error>;
+    }
+    #[cfg(all(any(feature = "sign", test), not(target_os = "solana")))]
+    pub trait OneTime {}
 }
