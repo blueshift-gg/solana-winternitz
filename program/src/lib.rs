@@ -4,7 +4,7 @@ use solana_account_info::AccountInfo;
 use solana_program_entrypoint::entrypoint;
 use solana_program_error::{ProgramError, ProgramResult};
 use solana_pubkey::Pubkey;
-use solana_winternitz::{MESSAGE_LEN, PUBLIC_KEY_LEN, VerifyingKey, winternitz, xmss};
+use solana_winternitz::{MESSAGE_LEN, PUBLIC_KEY_LEN};
 
 entrypoint!(process_instruction);
 
@@ -35,8 +35,9 @@ fn create(account: &AccountInfo, tag: u8, data: &[u8]) -> ProgramResult {
     if !account.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    let key =
-        VerifyingKey::ref_from_bytes(data).map_err(|_| ProgramError::InvalidInstructionData)?;
+    // Both crates' keys are `node ‖ P`, 41 bytes.
+    let key = solana_winternitz::VerifyingKey::ref_from_bytes(data)
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
     let mut bytes = account.try_borrow_mut_data()?;
     if bytes[0] != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
@@ -53,27 +54,36 @@ fn verify(account: &AccountInfo, data: &[u8]) -> ProgramResult {
         .split_first_chunk::<MESSAGE_LEN>()
         .ok_or(ProgramError::InvalidInstructionData)?;
     let mut bytes = account.try_borrow_mut_data()?;
-    let key = VerifyingKey::from_slice(&bytes[1..KEY_END])
-        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let key = &bytes[1..KEY_END];
     let (leaf, result) = match bytes[0] {
         0 => return Err(ProgramError::UninitializedAccount),
         1 => (
             0,
-            key.verify(
-                digest,
-                winternitz::Signature::ref_from_bytes(signature)
-                    .map_err(|_| ProgramError::InvalidInstructionData)?,
-            ),
+            solana_winternitz::VerifyingKey::ref_from_bytes(key)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                .verify(
+                    digest,
+                    solana_winternitz::Signature::ref_from_bytes(signature)
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                )
+                .is_ok(),
         ),
         2 => {
-            let signature = xmss::Signature::ref_from_bytes(signature)
+            let signature = solana_xmss::Signature::ref_from_bytes(signature)
                 .map_err(|_| ProgramError::InvalidInstructionData)?;
-            (signature.leaf() as usize, key.verify(digest, signature))
+            let key = solana_xmss::VerifyingKey::ref_from_bytes(key)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+            (
+                signature.leaf() as usize,
+                key.verify(digest, signature).is_ok(),
+            )
         }
         _ => return Err(ProgramError::InvalidAccountData),
     };
     // Verification checks the leaf bound before it is used to index the bitmap.
-    result.map_err(|_| ProgramError::Custom(1))?;
+    if !result {
+        return Err(ProgramError::Custom(1));
+    }
     let used = &mut bytes[KEY_END + leaf / 8];
     let mask = 1 << (leaf % 8);
     if *used & mask != 0 {

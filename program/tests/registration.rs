@@ -3,8 +3,9 @@ use solana_account::Account;
 use solana_address::Address;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_system_interface::{instruction::create_account, program::ID as SYSTEM_PROGRAM};
-use solana_winternitz::{winternitz, xmss};
+use solana_winternitz::SigningKey;
 use solana_winternitz_example::KEY_ACCOUNT_LEN;
+use solana_xmss::SigningKey as TreeSigningKey;
 
 #[test]
 fn create_sign_and_verify_both_instances() {
@@ -21,20 +22,20 @@ fn create_sign_and_verify_both_instances() {
         let digest = [7; 32];
         // Secrets remain in the host key file. Only public keys and signatures go on-chain.
         let (public_key, signed) = if tag == 0 {
-            let mut signer = winternitz::SigningKey::create(&path).unwrap();
+            let mut signer = SigningKey::create(&path).unwrap();
             let signature = signer.sign(&digest).unwrap();
             (
-                signer.verifying_key(),
+                signer.verifying_key().to_bytes(),
                 vec![(digest, signature.as_bytes().to_vec())],
             )
         } else {
-            let mut signer = xmss::SigningKey::create(&path).unwrap();
+            let mut signer = TreeSigningKey::create(&path).unwrap();
             let first = signer.sign(&digest).unwrap();
             let second_digest = [8; 32];
             let second = signer.sign(&second_digest).unwrap();
             // A bitmap allows unused leaves to arrive out of order.
             (
-                signer.verifying_key(),
+                signer.verifying_key().to_bytes(),
                 vec![
                     (second_digest, second.as_bytes().to_vec()),
                     (digest, first.as_bytes().to_vec()),
@@ -45,7 +46,7 @@ fn create_sign_and_verify_both_instances() {
             (payer, Account::new(1_000_000_000, 0, &SYSTEM_PROGRAM)),
             (key, Account::default()),
         ];
-        let data = [&[tag][..], public_key.as_bytes()].concat();
+        let data = [&[tag][..], &public_key[..]].concat();
         let create = Instruction::new_with_bytes(program, &data, vec![AccountMeta::new(key, true)]);
         let instructions = [
             create_account(
@@ -66,7 +67,7 @@ fn create_sign_and_verify_both_instances() {
             .unwrap()
             .1;
         assert_eq!(stored.data[0], tag + 1);
-        assert_eq!(&stored.data[1..42], public_key.as_bytes());
+        assert_eq!(&stored.data[1..42], &public_key[..]);
         assert_eq!(&stored.data[42..], &[0; 32]);
         eprintln!("create {tag}: {} CU", created.compute_units_consumed);
         assert!(

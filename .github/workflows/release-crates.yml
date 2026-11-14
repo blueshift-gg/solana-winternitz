@@ -23,17 +23,22 @@ jobs:
           test "$tag" = "v$v" \
             || { echo "::error::tag ${tag} does not match Cargo.toml version v$v"; exit 1; }
 
-      - name: Check crate version not already published
+      - name: Check crate versions not already published
         id: check
         run: |
-          v="${GITHUB_REF_NAME#v}"
-          if curl -fsS -H 'User-Agent: blueshift-gg-release (github-actions)' \
-              "https://crates.io/api/v1/crates/solana-winternitz/$v" >/dev/null 2>&1; then
-            echo "solana-winternitz $v is already published to crates.io; skipping publish"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          skip=true
+          for manifest in Cargo.toml xmss/Cargo.toml; do
+            name=$(yq -e '.package.name' "$manifest")
+            v=$(yq -e '.package.version' "$manifest")
+            if curl -fsS -H 'User-Agent: blueshift-gg-release (github-actions)' \
+                "https://crates.io/api/v1/crates/$name/$v" >/dev/null 2>&1; then
+              echo "$name $v is already published to crates.io"
+            else
+              echo "$name $v will be published"
+              skip=false
+            fi
+          done
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
 
   publish:
     name: Publish crates

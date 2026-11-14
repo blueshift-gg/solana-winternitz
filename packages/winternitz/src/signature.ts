@@ -1,8 +1,6 @@
-import { bytes, SALT_LENGTH, ELEMENTS_LENGTH } from './core.js';
+import { bytes, SIGNATURE_LEN } from './core.js';
 
-/** `(ρ, σ_OTS)` of Construction 3. */
-export const SIGNATURE_LEN = SALT_LENGTH + ELEMENTS_LENGTH;
-
+/** A one-time signature, `(ρ, σ_OTS)` of Construction 3: 849 bytes. */
 export class Signature {
   static readonly BYTE_LEN = SIGNATURE_LEN;
   readonly #bytes: Uint8Array;

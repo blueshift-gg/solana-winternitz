@@ -6,37 +6,10 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    ELEMENTS_LENGTH, Error, MESSAGE_LEN, PARAMETER_LEN, SALT_LENGTH, VerifyingKey, encode,
+    MESSAGE_LEN, PARAMETER_LEN,
+    hazmat::OneTime,
+    primitives::{ELEMENTS_LEN, SALT_LEN, encode},
 };
-
-/// Raw Construction 3 operations. These do not enforce one use per leaf;
-/// Use [`crate::xmss::SigningKey`] or [`crate::winternitz::SigningKey`] for
-/// signing. Never reuse chain starts across keys.
-/// Sealed to the built-in Winternitz and XMSS instances and their key-file tags.
-pub trait OneTime: crate::sealed::OneTime + Sized {
-    /// The instance's signature type.
-    type Signature;
-    /// Leaves per key: 1 or 256.
-    const LEAVES: u32;
-    /// Tree height; also the key-file instance tag.
-    const HEIGHT: u8;
-    /// Copy independently sampled chain starts in leaf-major, chain-major
-    /// order (828 bytes per leaf), and the independently sampled `P`.
-    /// Returns `Error::InvalidLength` for the wrong secret length. Records no usage state.
-    fn from_secrets(secrets: &[u8], parameter: [u8; PARAMETER_LEN]) -> Result<Self, Error>;
-    /// Raw secret bytes for persistence. These alone cannot restore usage state.
-    fn secrets(&self) -> &[u8];
-    /// `root ‖ P`.
-    fn verifying_key(&self) -> VerifyingKey;
-    /// Sign with an accepted salt. `None` for an invalid leaf or encoding.
-    /// Never use a spent leaf with a different message or salt.
-    fn sign_at_with_salt(
-        &self,
-        leaf: u32,
-        message: &[u8; MESSAGE_LEN],
-        salt: &[u8; SALT_LENGTH],
-    ) -> Option<Self::Signature>;
-}
 
 /// Key-file or signing failure. No signature is returned on error.
 #[derive(Debug)]
@@ -110,7 +83,7 @@ const NEXT_LEAF: usize = PARAMETER + PARAMETER_LEN;
 const HAS_MESSAGE: usize = NEXT_LEAF + 4;
 const MESSAGE: usize = HAS_MESSAGE + 1;
 const SALT: usize = MESSAGE + MESSAGE_LEN;
-const SECRETS: usize = SALT + SALT_LENGTH;
+const SECRETS: usize = SALT + SALT_LEN;
 
 /// Makes Definition 8's signing state durable in an exclusively locked key file.
 /// Retries of the recorded message return the same signature.
@@ -120,14 +93,21 @@ pub struct SigningKey<K: OneTime> {
     _lock: File,
     next_leaf: u32,
     last_message: Option<[u8; MESSAGE_LEN]>,
-    last_salt: [u8; SALT_LENGTH],
+    last_salt: [u8; SALT_LEN],
     failed: bool,
 }
 
 impl<K: OneTime> SigningKey<K> {
+    /// The key-file tags this format knows: one leaf, or a tree of height 8.
+    const INSTANCE: () = assert!(
+        (K::HEIGHT == 0 || K::HEIGHT == 8) && K::LEAVES == 1 << K::HEIGHT,
+        "unknown key-file instance"
+    );
+
     /// Sample every chain start and `P` from the OS random source, as in
     /// Construction 3 Gen. Refuses an existing file.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, SigningError> {
+        let () = Self::INSTANCE;
         let path = path.as_ref().to_path_buf();
         let lock = lock(&path)?;
         let mut file = options()
@@ -138,7 +118,7 @@ impl<K: OneTime> SigningKey<K> {
                 io::ErrorKind::AlreadyExists => SigningError::Exists,
                 _ => SigningError::Io(error),
             })?;
-        let mut secrets = std::vec![0; K::LEAVES as usize * ELEMENTS_LENGTH];
+        let mut secrets = std::vec![0; K::LEAVES as usize * ELEMENTS_LEN];
         let mut parameter = [0; PARAMETER_LEN];
         let sampled = getrandom::fill(&mut secrets).and_then(|()| getrandom::fill(&mut parameter));
         let key = sampled
@@ -151,7 +131,7 @@ impl<K: OneTime> SigningKey<K> {
             _lock: lock,
             next_leaf: 0,
             last_message: None,
-            last_salt: [0; SALT_LENGTH],
+            last_salt: [0; SALT_LEN],
             failed: false,
         };
         signer.write_record(&mut file)?;
@@ -162,6 +142,7 @@ impl<K: OneTime> SigningKey<K> {
 
     /// Open a v2 key file and hold its permanent sidecar lock.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SigningError> {
+        let () = Self::INSTANCE;
         let path = path.as_ref().to_path_buf();
         let lock = lock(&path)?;
         let mut file = File::open(&path).map_err(|error| match error.kind() {
@@ -169,7 +150,7 @@ impl<K: OneTime> SigningKey<K> {
             _ => SigningError::Io(error),
         })?;
         let mut header = [0; SECRETS];
-        if file.metadata()?.len() != (SECRETS + K::LEAVES as usize * ELEMENTS_LENGTH) as u64 {
+        if file.metadata()?.len() != (SECRETS + K::LEAVES as usize * ELEMENTS_LEN) as u64 {
             return Err(SigningError::Corrupt);
         }
         file.read_exact(&mut header)?;
@@ -177,7 +158,7 @@ impl<K: OneTime> SigningKey<K> {
         let parameter: [u8; PARAMETER_LEN] = header[PARAMETER..NEXT_LEAF].try_into().unwrap();
         let last_message =
             (header[HAS_MESSAGE] == 1).then(|| header[MESSAGE..SALT].try_into().unwrap());
-        let last_salt: [u8; SALT_LENGTH] = header[SALT..].try_into().unwrap();
+        let last_salt: [u8; SALT_LEN] = header[SALT..].try_into().unwrap();
         if header[0] != VERSION
             || header[1] != K::HEIGHT
             || header[HAS_MESSAGE] > 1
@@ -190,7 +171,7 @@ impl<K: OneTime> SigningKey<K> {
         {
             return Err(SigningError::Corrupt);
         }
-        let mut secrets = std::vec![0; K::LEAVES as usize * ELEMENTS_LENGTH];
+        let mut secrets = std::vec![0; K::LEAVES as usize * ELEMENTS_LEN];
         let key = file
             .read_exact(&mut secrets)
             .map_err(SigningError::Io)
@@ -220,8 +201,8 @@ impl<K: OneTime> SigningKey<K> {
         }
         Ok(self)
     }
-    /// `root ‖ P`.
-    pub fn verifying_key(&self) -> VerifyingKey {
+    /// The public key.
+    pub fn verifying_key(&self) -> K::VerifyingKey {
         self.key.verifying_key()
     }
     /// The leaf allocated by the next attempt; retries do not advance it.
@@ -264,13 +245,12 @@ impl<K: OneTime> SigningKey<K> {
             return Err(SigningError::Exhausted);
         }
         let leaf = self.next_leaf;
-        let parameter = self.verifying_key();
-        let sampled = crate::hazmat::sample_salt(parameter.parameter(), leaf, message, &mut fill);
+        let sampled = crate::hazmat::sample_salt(self.key.parameter(), leaf, message, &mut fill);
         // Definition 8 permits one attempt per leaf, including failure.
         // Persist the attempt before returning either a signature or error.
         self.next_leaf = leaf + 1;
         self.last_message = sampled.is_ok().then_some(*message);
-        self.last_salt = sampled.as_ref().copied().unwrap_or([0; SALT_LENGTH]);
+        self.last_salt = sampled.as_ref().copied().unwrap_or([0; SALT_LEN]);
         if let Err(error) = self.write() {
             self.failed = true;
             return Err(error);
@@ -284,7 +264,7 @@ impl<K: OneTime> SigningKey<K> {
         let mut header = [0; SECRETS];
         header[0] = VERSION;
         header[1] = K::HEIGHT;
-        header[PARAMETER..NEXT_LEAF].copy_from_slice(self.verifying_key().parameter());
+        header[PARAMETER..NEXT_LEAF].copy_from_slice(self.key.parameter());
         header[NEXT_LEAF..HAS_MESSAGE].copy_from_slice(&self.next_leaf.to_be_bytes());
         if let Some(message) = &self.last_message {
             header[HAS_MESSAGE] = 1;
@@ -357,7 +337,7 @@ fn sync_dir(path: &Path) -> Result<(), SigningError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{winternitz, xmss};
+    use crate::tests::TreeSigningKey;
 
     #[test]
     fn failed_grinding_and_persistence_never_release_a_signature() {
@@ -365,12 +345,12 @@ mod tests {
             std::env::temp_dir().join(std::format!("winternitz-failure-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("once.key");
-        let mut signer = xmss::SigningKey::create(&path).unwrap();
+        let mut signer = TreeSigningKey::create(&path).unwrap();
         let message = [0; MESSAGE_LEN];
-        let mut bad = [0; SALT_LENGTH];
+        let mut bad = [0; SALT_LEN];
         for counter in 0u32.. {
             bad[..4].copy_from_slice(&counter.to_le_bytes());
-            if encode(&bad, signer.verifying_key().parameter(), 0, &message).is_none() {
+            if encode(&bad, &signer.verifying_key().parameter, 0, &message).is_none() {
                 break;
             }
         }
@@ -383,7 +363,7 @@ mod tests {
             }),
             Err(SigningError::SaltsExhausted)
         ));
-        assert_eq!(trials, crate::signing::MAX_TRIALS);
+        assert_eq!(trials, crate::hazmat::MAX_TRIALS);
         assert!(matches!(
             signer.sign_with_rng(&message, |_| Err(SigningError::Io(io::Error::other(
                 "entropy unavailable"
@@ -394,7 +374,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         assert_eq!(before[HAS_MESSAGE], 0);
         drop(signer);
-        let mut signer = xmss::SigningKey::open(&path).unwrap();
+        let mut signer = TreeSigningKey::open(&path).unwrap();
         assert_eq!(signer.next_leaf(), 2);
 
         std::fs::create_dir(sibling(&path, ".tmp")).unwrap();
@@ -403,7 +383,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         drop(signer);
         std::fs::remove_dir(sibling(&path, ".tmp")).unwrap();
-        let mut signer = xmss::SigningKey::open(&path).unwrap();
+        let mut signer = TreeSigningKey::open(&path).unwrap();
         let sig = signer.sign(&message).unwrap();
         assert_eq!(
             signer
@@ -412,14 +392,14 @@ mod tests {
             sig
         );
         drop(signer);
-        let mut signer = xmss::SigningKey::open(&path).unwrap();
+        let mut signer = TreeSigningKey::open(&path).unwrap();
         assert_eq!(
             signer
                 .sign_with_rng(&message, |_| panic!("reopened retry drew randomness"))
                 .unwrap(),
             sig
         );
-        assert_eq!(sig.verify(&signer.verifying_key(), &message), Ok(()));
+        assert_eq!(signer.verifying_key().verify(&message, &sig), Ok(()));
         drop(signer);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -462,7 +442,7 @@ mod tests {
         for bytes in variants {
             std::fs::write(&path, bytes).unwrap();
             assert!(matches!(
-                winternitz::SigningKey::open(&path),
+                crate::SigningKey::open(&path),
                 Err(SigningError::Corrupt)
             ));
         }

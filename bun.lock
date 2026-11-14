@@ -11,14 +11,23 @@
     },
     "packages/winternitz": {
       "name": "@blueshift-gg/solana-winternitz",
-      "version": "0.1.0",
+      "version": "0.3.0",
       "dependencies": {
         "@noble/hashes": "^2.4.0",
+      },
+    },
+    "packages/xmss": {
+      "name": "@blueshift-gg/solana-xmss",
+      "version": "0.1.0",
+      "dependencies": {
+        "@blueshift-gg/solana-winternitz": "^0.3.0",
       },
     },
   },
   "packages": {
     "@blueshift-gg/solana-winternitz": ["@blueshift-gg/solana-winternitz@workspace:packages/winternitz"],
+
+    "@blueshift-gg/solana-xmss": ["@blueshift-gg/solana-xmss@workspace:packages/xmss"],
 
     "@noble/hashes": ["@noble/hashes@2.4.0", "", {}, "sha512-X5XaVWZIBCT7HHZGm5I7ZQXDwLG+bGXuSrMQAW+7Zvl87h1kmc1ZB1VSRJcpUfoUrGQp4Fkoxm5kZ+Ms+aW+eA=="],
 

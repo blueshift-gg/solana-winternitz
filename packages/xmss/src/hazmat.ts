@@ -1,15 +1,22 @@
-import { generateKey, sampleSalt, bytes, ELEMENTS_LENGTH, PARAMETER_LEN, MESSAGE_LEN, SALT_LENGTH, concat, leafHash, endsOf, signLeaf, node, u32be } from '../core.js';
-import { CryptoError, SigningError, type FillRandom } from '../error.js';
-import { VerifyingKey } from '../verifying-key.js';
-import { Signature, HEIGHT, LEAVES } from '../xmss.js';
+/** Raw signing with caller-managed leaf usage. A raw key does not persist
+ * state or prevent signing a leaf twice. Prefer `./signer`; never restore usage
+ * state from secret bytes alone. */
+import { CryptoError, generateKey, sampleSalt, bytes, concat, node, publicLeaf, signLeaf, u32be, ELEMENTS_LENGTH, PARAMETER_LEN, MESSAGE_LEN, SALT_LENGTH } from '@blueshift-gg/solana-winternitz/primitives';
+import { SigningError, type FillRandom } from '@blueshift-gg/solana-winternitz/hazmat';
+import { VerifyingKey } from './verifying-key.js';
+import { Signature, HEIGHT, LEAVES } from './signature.js';
+
+export { SigningError, type SigningErrorCode, type FillRandom } from '@blueshift-gg/solana-winternitz/hazmat';
 
 const levelOffset = (l: number) => 2 * LEAVES - (2 << (HEIGHT - l));
 
 /** Construction 3 key generation and signing with caller-managed leaf allocation;
- * use `SigningKey` from `./signer` for durable usage state. */
+ * caches the Merkle tree. Use `SigningKey` from `./signer` for durable usage state. */
 export class SecretKey {
   static readonly LEAVES = LEAVES;
   static readonly HEIGHT = HEIGHT;
+  readonly leaves = LEAVES;
+  readonly height = HEIGHT;
   readonly #secrets: Uint8Array;
   readonly #parameter: Uint8Array;
   /** Level-major: leaves first, root last. */
@@ -19,11 +26,11 @@ export class SecretKey {
     this.#secrets = secrets;
     this.#parameter = parameter;
     this.#nodes = new Array(2 * LEAVES - 1);
-    for (let leaf = 0; leaf < LEAVES; leaf++) this.#nodes[leaf] = leafHash(this.#parameter, leaf, endsOf(secrets, this.#parameter, leaf));
+    for (let leaf = 0; leaf < LEAVES; leaf++) this.#nodes[leaf] = publicLeaf(secrets, parameter, leaf);
     for (let l = 1; l <= HEIGHT; l++) {
       for (let i = 0; i < LEAVES >> l; i++) {
         const child = levelOffset(l - 1) + 2 * i;
-        this.#nodes[levelOffset(l) + i] = node(this.#parameter, l, i, this.#nodes[child]!, this.#nodes[child + 1]!);
+        this.#nodes[levelOffset(l) + i] = node(parameter, l, i, this.#nodes[child]!, this.#nodes[child + 1]!);
       }
     }
   }
@@ -53,12 +60,12 @@ export class SecretKey {
   /** Raw chain starts; never restore usage state from these alone. */
   get secrets(): Uint8Array { return this.#secrets.slice(); }
 
+  /** The public parameter `P`. */
+  get parameter(): Uint8Array { return this.#parameter.slice(); }
+
   verifyingKey(): VerifyingKey {
     return VerifyingKey.fromBytes(concat(this.#nodes[levelOffset(HEIGHT)]!, this.#parameter));
   }
-
-  readonly leaves = LEAVES;
-  readonly height = HEIGHT;
 
   /** Reproduce a recorded signature using its accepted salt. Records no usage state. */
   signAtWithSalt(leaf: number, message: Uint8Array, salt: Uint8Array): Signature {

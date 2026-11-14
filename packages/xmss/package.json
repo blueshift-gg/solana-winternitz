@@ -1,0 +1,32 @@
+{
+  "name": "@blueshift-gg/solana-xmss",
+  "version": "0.1.0",
+  "description": "Post-quantum hash-based signatures for Solana: a 256-leaf DKKW25 generalized XMSS tree over Keccak-256, byte-for-byte the solana-xmss crate.",
+  "license": "MIT",
+  "repository": "https://github.com/blueshift-gg/solana-winternitz",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    },
+    "./signer": {
+      "types": "./dist/src/signer.d.ts",
+      "default": "./dist/src/signer.js"
+    },
+    "./hazmat": {
+      "types": "./dist/src/hazmat.d.ts",
+      "default": "./dist/src/hazmat.js"
+    }
+  },
+  "files": [
+    "dist/src"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@blueshift-gg/solana-winternitz": "^0.3.0"
+  }
+}

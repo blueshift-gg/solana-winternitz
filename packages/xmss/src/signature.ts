@@ -1,10 +1,13 @@
-import { bytes, SALT_LENGTH, ELEMENTS_LENGTH, ELEMENT_LENGTH } from './core.js';
+import { bytes, SALT_LENGTH, ELEMENTS_LENGTH, ELEMENT_LENGTH } from '@blueshift-gg/solana-winternitz/primitives';
 
+/** Tree height `h`. */
 export const HEIGHT = 8;
+/** Maximum signing attempts per key. */
 export const LEAVES = 1 << HEIGHT;
 /** `(ep, ρ, σ_OTS, path_ep)` of Construction 3, `ep` as u32 big-endian. */
 export const SIGNATURE_LEN = 4 + SALT_LENGTH + ELEMENTS_LENGTH + HEIGHT * ELEMENT_LENGTH;
 
+/** A signature under one leaf, 1,037 bytes. */
 export class Signature {
   static readonly BYTE_LEN = SIGNATURE_LEN;
   readonly #bytes: Uint8Array;
