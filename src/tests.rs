@@ -469,3 +469,125 @@ fn sdk_encoding_contract() {
         Err(Error::InvalidLength)
     );
 }
+
+/// Verify-only known answers, checked byte for byte by the Rust and
+/// TypeScript verifiers: valid signatures at both ends of the tree and
+/// mutations each verifier must refuse.
+#[test]
+fn verify_vectors() {
+    let vectors: Value = serde_json::from_str(include_str!("../tests/vectors.json")).unwrap();
+    let mut seen = 0;
+    for (scheme, set) in vectors["schemes"].as_object().unwrap() {
+        let pk = VerifyingKey::from_slice(&hex(set["public_key"].as_str().unwrap())).unwrap();
+        for case in set["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let m: [u8; MESSAGE_LEN] = hex(case["message"].as_str().unwrap()).try_into().unwrap();
+            let sig = hex(case["signature"].as_str().unwrap());
+            let result = match scheme.as_str() {
+                "winternitz" => pk.verify(&m, &winternitz::Signature::from_slice(&sig).unwrap()),
+                "xmss" => pk.verify(&m, &xmss::Signature::from_slice(&sig).unwrap()),
+                other => panic!("unknown scheme {other}"),
+            };
+            let expected = if case["valid"].as_bool().unwrap() {
+                Ok(())
+            } else {
+                Err(Error::InvalidSignature)
+            };
+            assert_eq!(result, expected, "{scheme} {name}");
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 15);
+}
+
+/// Regenerate `tests/vectors.json`.
+#[test]
+#[ignore]
+fn regenerate_verify_vectors() {
+    fn case(name: &str, m: &[u8; MESSAGE_LEN], sig: &[u8], valid: bool) -> Value {
+        serde_json::json!({ "name": name, "message": to_hex(m), "signature": to_hex(sig), "valid": valid })
+    }
+    /// A salt whose digest misses the target sum, so encoding refuses it.
+    fn bad_salt(parameter: &[u8], leaf: u32, m: &[u8; MESSAGE_LEN]) -> [u8; SALT_LENGTH] {
+        (0u32..)
+            .find_map(|counter| {
+                let mut salt = [0xa5; SALT_LENGTH];
+                salt[..4].copy_from_slice(&counter.to_le_bytes());
+                crate::encode(&salt, parameter, leaf, m)
+                    .is_none()
+                    .then_some(salt)
+            })
+            .unwrap()
+    }
+
+    let once = key::<hazmat::winternitz::SecretKey>(7);
+    let once_pk = once.verifying_key();
+    let m = message(b"one-time");
+    let sig = sign(&once, 0, &m).0;
+    let mut other = m;
+    other[31] ^= 1;
+    let mut bad_sum = sig;
+    bad_sum[..SALT_LENGTH].copy_from_slice(&bad_salt(once_pk.parameter(), 0, &m));
+    let mut element = sig;
+    element[SALT_LENGTH + 5 * ELEMENT_LENGTH] ^= 0x80;
+    let winternitz_cases = std::vec![
+        case("valid", &m, &sig, true),
+        case("other message", &other, &sig, false),
+        case("salt misses the target sum", &m, &bad_sum, false),
+        case("chain element flipped", &m, &element, false),
+    ];
+
+    let tree = key::<hazmat::xmss::SecretKey>(7);
+    let tree_pk = tree.verifying_key();
+    let mut xmss_cases: Vec<Value> = [0u32, 1, 127, 128, 254, 255]
+        .into_iter()
+        .map(|leaf| {
+            let m = message(&leaf.to_le_bytes());
+            case(
+                &std::format!("valid at leaf {leaf}"),
+                &m,
+                &sign(&tree, leaf, &m).0,
+                true,
+            )
+        })
+        .collect();
+    let m = message(&0u32.to_le_bytes());
+    let leaf0 = sign(&tree, 0, &m).0;
+    let mut wrong_leaf = leaf0;
+    wrong_leaf[..4].copy_from_slice(&1u32.to_be_bytes());
+    let mut out_of_range = leaf0;
+    out_of_range[..4].copy_from_slice(&xmss::LEAVES.to_be_bytes());
+    let mut bad_sum = leaf0;
+    bad_sum[4..4 + SALT_LENGTH].copy_from_slice(&bad_salt(tree_pk.parameter(), 0, &m));
+    let m255 = message(&255u32.to_le_bytes());
+    let mut path = sign(&tree, 255, &m255).0;
+    *path.last_mut().unwrap() ^= 1;
+    let mut other = m;
+    other[0] ^= 1;
+    xmss_cases.extend([
+        case(
+            "leaf 0 signature relabelled as leaf 1",
+            &m,
+            &wrong_leaf,
+            false,
+        ),
+        case("leaf 256 is out of range", &m, &out_of_range, false),
+        case("salt misses the target sum", &m, &bad_sum, false),
+        case("top authentication path byte flipped", &m255, &path, false),
+        case("other message", &other, &leaf0, false),
+    ]);
+
+    std::fs::write(
+        "tests/vectors.json",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "test_inputs": "Public test data only, as tests/sampled.json: chain-start byte i = (i mod 251) xor 7; P = 18 bytes of 0x57; salt = first accepted counter LE32 padded to 21 bytes. Every invalid case must fail verification.",
+            "schemes": {
+                "winternitz": { "public_key": to_hex(&once_pk.0), "cases": winternitz_cases },
+                "xmss": { "public_key": to_hex(&tree_pk.0), "cases": xmss_cases },
+            },
+        }))
+        .unwrap()
+            + "\n",
+    )
+    .unwrap();
+}
