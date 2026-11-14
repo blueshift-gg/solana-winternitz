@@ -2,6 +2,7 @@ import { expect, test, spyOn } from 'bun:test';
 import sampled from '../../../tests/sampled.json' with { type: 'json' };
 import * as crypto from 'node:crypto';
 import reference from '../../../tests/hash-sig.json' with { type: 'json' };
+import vectors from '../../../tests/vectors.json' with { type: 'json' };
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -92,6 +93,19 @@ test.each(reference.signatures)('the hash-sig signature at leaf $leaf verifies',
   const other = fromHex(message);
   other[0]! ^= 1;
   expectCode(() => (key).verify(other, signature), 'InvalidSignature');
+});
+
+// The same verify-only known answers the Rust `verify_vectors` test checks.
+const vectorCases = Object.entries(vectors.schemes).flatMap(([scheme, set]) =>
+  set.cases.map((c) => ({ scheme, publicKey: set.public_key, ...c })));
+test('the shared vector file covers both schemes', () => {
+  expect(vectorCases.length).toBe(15);
+});
+test.each(vectorCases)('$scheme vector: $name', ({ scheme, publicKey, message, signature, valid }) => {
+  const key = VerifyingKey.fromBytes(fromHex(publicKey));
+  const sig = scheme === 'xmss' ? xmss.Signature.fromBytes(fromHex(signature)) : winternitz.Signature.fromBytes(fromHex(signature));
+  if (valid) expect(() => key.verify(fromHex(message), sig)).not.toThrow();
+  else expectCode(() => key.verify(fromHex(message), sig), 'InvalidSignature');
 });
 
 // Deliberately non-random public inputs, matching the Rust fixture generator.
