@@ -21,8 +21,10 @@ export const ROLE_MESSAGE = 2;
 /** Application-supplied digest length in bytes (Remark 1). */
 export const MESSAGE_LEN = 32;
 
-/** `node || P`: the leaf for `winternitz`, the Merkle root for `xmss`. */
+/** `leaf || P` for a one-time key; `@blueshift-gg/solana-xmss` uses `root || P`. */
 export const PUBLIC_KEY_LEN = ELEMENT_LENGTH + PARAMETER_LEN;
+/** `(ρ, σ_OTS)` of Construction 3. */
+export const SIGNATURE_LEN = SALT_LENGTH + ELEMENTS_LENGTH;
 
 export function concat(...parts: Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
@@ -79,9 +81,17 @@ export function leafHash(parameter: Uint8Array, leaf: number, ends: Uint8Array[]
   return keccak_256(concat(parameter, treeTweak(0, leaf), ...ends)).subarray(0, ELEMENT_LENGTH);
 }
 
-/** Construction 1 node. */
+/** Construction 1 node at level 1 or above; level 0 holds leaves. */
 export function node(parameter: Uint8Array, level: number, index: number, left: Uint8Array, right: Uint8Array): Uint8Array {
+  if (!Number.isInteger(level) || level < 1 || level > 255) throw new RangeError('level 0 holds leaves');
   return keccak_256(concat(parameter, treeTweak(level, index), left, right)).subarray(0, ELEMENT_LENGTH);
+}
+
+/** The leaf a one-time signature `(salt, elements)` at `leaf` commits to for
+ * `message`, or `undefined` if the salted digest misses the target sum. */
+export function leaf(parameter: Uint8Array, leaf: number, salt: Uint8Array, elements: Uint8Array, message: Uint8Array): Uint8Array | undefined {
+  const x = encode(salt, parameter, leaf, message);
+  return x && leafHash(parameter, leaf, endsFromSignature(parameter, leaf, x, elements));
 }
 
 /** Explicit chain starts, in leaf-major, chain-major order. */

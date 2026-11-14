@@ -1,36 +1,36 @@
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { randomFillSync } from 'node:crypto';
 import { dirname } from 'node:path';
-import { bytes, equal, encode, ELEMENTS_LENGTH, ELEMENT_LENGTH, PARAMETER_LEN, MESSAGE_LEN, SALT_LENGTH, sampleSalt } from './core.js';
-import { VerifyingKey } from './verifying-key.js';
+import { bytes, equal, encode, ELEMENTS_LENGTH, PARAMETER_LEN, MESSAGE_LEN, SALT_LENGTH, sampleSalt } from './core.js';
 import { CryptoError, SigningError, signingError, type FillRandom } from './error.js';
-import * as winternitz from './hazmat/winternitz.js';
-import * as xmss from './hazmat/xmss.js';
 
 function fillRandom(bytes: Uint8Array): Uint8Array {
   try { return randomFillSync(bytes); }
   catch (error) { throw signingError(error, 'Random'); }
 }
 
-/** Raw operations without a one-use rule. Use `SigningKey`; never reuse starts across keys. */
-interface OneTime<S> {
+/** Raw operations without a one-use rule. Use a key file; never reuse starts across keys. */
+export interface OneTime<S, V> {
   readonly leaves: number;
   readonly height: number;
-  verifyingKey(): VerifyingKey;
+  verifyingKey(): V;
+  /** The public parameter `P`. */
+  readonly parameter: Uint8Array;
   readonly secrets: Uint8Array;
   /** Never use a spent leaf with a different message or salt. */
   signAtWithSalt(leaf: number, message: Uint8Array, salt: Uint8Array): S;
 }
 
-/** `winternitz.SecretKey` or `xmss.SecretKey`. */
-interface KeyType<S> {
+/** A raw key class: this package's `SecretKey` or `@blueshift-gg/solana-xmss`'s. */
+export interface KeyType<S, V> {
   readonly LEAVES: number;
   readonly HEIGHT: number;
-  fromSecrets(secrets: Uint8Array, parameter: Uint8Array): OneTime<S>;
+  fromSecrets(secrets: Uint8Array, parameter: Uint8Array): OneTime<S, V>;
 }
 
-function checkKeyType(type: unknown): void {
-  if (type !== winternitz.SecretKey && type !== xmss.SecretKey) throw new SigningError('Corrupt', 'unsupported signing instance');
+/** The key-file tags this format knows: one leaf, or a tree of height 8. */
+function checkKeyType(type: KeyType<unknown, unknown>): void {
+  if (!(type.HEIGHT === 0 || type.HEIGHT === 8) || type.LEAVES !== 2 ** type.HEIGHT) throw new SigningError('Corrupt', 'unsupported signing instance');
 }
 
 // v2: version || height || P || next leaf BE || message flag || message || accepted salt || chain starts.
@@ -42,10 +42,10 @@ const MESSAGE = HAS_MESSAGE + 1;
 const SALT = MESSAGE + MESSAGE_LEN;
 const SECRETS = SALT + SALT_LENGTH;
 
-/** Makes Definition 8 signing state durable in an exclusively locked key file.
- * Requires Bun on macOS or Linux with glibc. */
-export class SigningKey<S> {
-  readonly #key: OneTime<S>;
+/** Makes Definition 8 signing state durable in an exclusively locked key file,
+ * for any raw key class. Requires Bun on macOS or Linux with glibc. */
+export class KeyFile<S, V> {
+  readonly #key: OneTime<S, V>;
   readonly #path: string;
   readonly #lock: number;
   #nextLeaf: number;
@@ -54,7 +54,7 @@ export class SigningKey<S> {
   #closed = false;
   #sampling = false;
 
-  private constructor(key: OneTime<S>, path: string, lock: number, nextLeaf: number, lastSalt: Uint8Array, lastMessage?: Uint8Array) {
+  private constructor(key: OneTime<S, V>, path: string, lock: number, nextLeaf: number, lastSalt: Uint8Array, lastMessage?: Uint8Array) {
     this.#key = key;
     this.#path = path;
     this.#lock = lock;
@@ -64,8 +64,7 @@ export class SigningKey<S> {
   }
 
   /** Sample every chain start and `P` from the OS random source. Refuses an existing file. */
-  static create<S>(type: KeyType<S>, path: string): SigningKey<S> {
-    // Only the built-in instances may choose a key-file tag.
+  static create<S, V>(type: KeyType<S, V>, path: string): KeyFile<S, V> {
     checkKeyType(type);
     const lock = acquire(path);
     try {
@@ -75,12 +74,12 @@ export class SigningKey<S> {
         if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new SigningError('Exists', 'a key file already exists at this path: open it instead');
         throw error;
       }
-      let signer: SigningKey<S>;
+      let signer: KeyFile<S, V>;
       const secrets = new Uint8Array(type.LEAVES * ELEMENTS_LENGTH);
       try {
         fillRandom(secrets);
         const parameter = fillRandom(new Uint8Array(PARAMETER_LEN));
-        signer = new SigningKey(type.fromSecrets(secrets, parameter), path, lock, 0, new Uint8Array(SALT_LENGTH));
+        signer = new KeyFile(type.fromSecrets(secrets, parameter), path, lock, 0, new Uint8Array(SALT_LENGTH));
         signer.#writeRecord(fd);
         fsyncSync(fd);
       } finally { secrets.fill(0); closeSync(fd); }
@@ -90,8 +89,7 @@ export class SigningKey<S> {
   }
 
   /** Open a v2 key file and hold its permanent sidecar lock. */
-  static open<S>(type: KeyType<S>, path: string): SigningKey<S> {
-    // Only the built-in instances may choose a key-file tag.
+  static open<S, V>(type: KeyType<S, V>, path: string): KeyFile<S, V> {
     checkKeyType(type);
     const lock = acquire(path);
     try {
@@ -111,7 +109,7 @@ export class SigningKey<S> {
         const lastSalt = Uint8Array.from(record.subarray(SALT, SECRETS));
         if (nextLeaf > type.LEAVES || (lastMessage && nextLeaf === 0)
             || (lastMessage ? !encode(lastSalt, parameter, nextLeaf - 1, lastMessage) : record.subarray(MESSAGE, SECRETS).some((b) => b !== 0))) throw corrupt;
-        return new SigningKey(type.fromSecrets(record.subarray(SECRETS), parameter), path, lock, nextLeaf, lastSalt, lastMessage);
+        return new KeyFile(type.fromSecrets(record.subarray(SECRETS), parameter), path, lock, nextLeaf, lastSalt, lastMessage);
       } finally { record.fill(0); }
     } catch (error) { release(lock); throw signingError(error); }
   }
@@ -128,7 +126,7 @@ export class SigningKey<S> {
     return this;
   }
 
-  verifyingKey(): VerifyingKey { return this.#key.verifyingKey(); }
+  verifyingKey(): V { return this.#key.verifyingKey(); }
   nextLeaf(): number { return this.#nextLeaf; }
   remaining(): number { return this.#key.leaves - this.#nextLeaf; }
 
@@ -149,7 +147,7 @@ export class SigningKey<S> {
     let salt: Uint8Array | undefined;
     let failure: unknown;
     this.#sampling = true;
-    try { salt = sampleSalt(this.verifyingKey().toBytes().subarray(ELEMENT_LENGTH), leaf, bytesOfMessage, fill); }
+    try { salt = sampleSalt(this.#key.parameter, leaf, bytesOfMessage, fill); }
     catch (error) { failure = signingError(error, 'Random'); }
     finally { this.#sampling = false; }
     // Definition 8 permits one attempt per leaf, including failure.
@@ -176,7 +174,7 @@ export class SigningKey<S> {
     const header = Buffer.alloc(SECRETS);
     header[0] = VERSION;
     header[1] = this.#key.height;
-    header.set(this.verifyingKey().toBytes().subarray(ELEMENT_LENGTH), PARAMETER);
+    header.set(this.#key.parameter, PARAMETER);
     header.writeUInt32BE(this.#nextLeaf, NEXT_LEAF);
     if (this.#lastMessage) {
       header[HAS_MESSAGE] = 1;
@@ -222,7 +220,7 @@ let libc: { symbols: { flock: (fd: number, operation: number) => number } } | un
 
 function flock(fd: number): boolean {
   if (typeof Bun === 'undefined' || process.platform === 'win32') {
-    throw new Error('SigningKey needs Bun on a unix host: the key-file lock is flock(2) through bun:ffi');
+    throw new Error('a key file needs Bun on a unix host: the key-file lock is flock(2) through bun:ffi');
   }
   if (!libc) {
     const { dlopen, FFIType } = require('bun:ffi') as typeof import('bun:ffi');

@@ -2882,7 +2882,7 @@ dependencies = [
 
 [[package]]
 name = "solana-winternitz"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "num-bigint 0.4.8",
