@@ -2904,15 +2904,6 @@ dependencies = [
  "solana-pubkey",
  "solana-system-interface",
  "solana-winternitz",
- "solana-xmss",
-]
-
-[[package]]
-name = "solana-xmss"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "solana-winternitz",
 ]
 
 [[package]]

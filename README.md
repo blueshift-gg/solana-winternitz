@@ -12,11 +12,11 @@ Winternitz over Keccak-256. Verification is `no_std` and uses Solana's
 | Crate | Max. signatures per key | Signature | Public key | Verify CU |
 |---|---:|---:|---:|---:|
 | `solana-winternitz` | 1 | 849 bytes | 41 bytes | ~34,800 |
-| [`solana-xmss`](xmss) | 256 | 1,037 bytes | 41 bytes | ~36,500 |
+| [`solana-xmss`](https://github.com/blueshift-gg/solana-xmss) | 256 | 1,037 bytes | 41 bytes | ~36,500 |
 
 A one-time key must sign exactly one message: two signatures from the same
 key let anyone forge. If a signed message can fail and need signing again,
-use [`solana-xmss`](xmss), whose 256 leaves are one-time keys under a single
+use [`solana-xmss`](https://github.com/blueshift-gg/solana-xmss), whose 256 leaves are one-time keys under a single
 public key.
 
 ## Usage
@@ -70,32 +70,30 @@ node, chain and message hashes cannot collide.
 
 ## Example program
 
-The [program](program/src/lib.rs) creates a public-key account and verifies
-signatures against it. The [test](program/tests/registration.rs) generates keys,
-signs on the host, creates the account with the System Program, and submits
-signatures for both crates.
+The [program](program/src/lib.rs) registers a one-time public key in an
+account, verifies one signature against it and marks the key spent. The
+[test](program/tests/registration.rs) generates a key, signs on the host,
+creates the account with the System Program and submits the signature.
 
 | Tag | Instruction data after tag | Operation |
 |---|---|---|
-| `0` | Public key, 41 bytes | Create a Winternitz key account |
-| `1` | Public key, 41 bytes | Create an XMSS key account |
-| `2` | Digest, 32 bytes, then signature | Verify and mark the leaf used |
+| `0` | Public key, 41 bytes | Register the key |
+| `1` | Digest, 32 bytes, then signature, 849 bytes | Verify and spend the key |
 
-The key account signs creation and is writable for both operations. It holds
-an instance byte, the public key and a 32-byte used-leaf bitmap (74 bytes total).
-Reused leaves are rejected; unused XMSS leaves may arrive out of order.
+The key account signs registration and is writable for both operations. It
+holds a state byte and the public key (42 bytes). A spent key refuses every
+further signature.
 
 ## TypeScript
 
-The TypeScript packages [`@blueshift-gg/solana-winternitz`](packages/winternitz)
-and [`@blueshift-gg/solana-xmss`](packages/xmss) include browser-compatible
+The [TypeScript package](packages/winternitz) includes browser-compatible
 verification and a `./signer` export for file-backed signing under Bun.
 
 ## Tests
 
 ```sh
-cargo test --workspace --exclude solana-winternitz-example --lib --features sign
-cargo test --workspace --exclude solana-winternitz-example --doc --features sign
+cargo test --lib --features sign
+cargo test --doc --features sign
 cargo build-sbf --arch v3 --manifest-path program/Cargo.toml
 cargo test -p solana-winternitz-example --test registration -- --nocapture
 bun install --frozen-lockfile
@@ -112,7 +110,7 @@ Based on [DKKW25](https://eprint.iacr.org/2025/055) and
 [hash-sig](https://github.com/b-wagn/hash-sig/tree/e66a48565d73c4d83d54e1b28fe249ab8c0d8542),
 using Keccak-256 and sampled chain starts. Unaudited.
 
-Version 0.3 moves XMSS to [`solana-xmss`](xmss); keys, signatures and key
+Version 0.3 moves XMSS to [`solana-xmss`](https://github.com/blueshift-gg/solana-xmss); keys, signatures and key
 files are unchanged from 0.2. Versions 0.2 and later are a new scheme and are
 not compatible with the 0.1.x releases (224-bit Keccak Winternitz without a
 checksum, which must not be used).

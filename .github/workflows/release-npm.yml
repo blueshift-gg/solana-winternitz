@@ -1,6 +1,6 @@
-name: Release npm packages
+name: Release npm package
 
-run-name: "Release npm packages ${{ github.ref_name }}"
+run-name: "Release npm package ${{ github.ref_name }}"
 
 on:
   push:
@@ -24,28 +24,25 @@ jobs:
           test "$v" = "$expected" \
             || { echo "::error::tag ${GITHUB_REF_NAME} does not match packages/winternitz/package.json version $v"; exit 1; }
 
-      - name: Check npm versions not already published
+      - name: Check npm version not already published
         id: check
         run: |
-          skip=true
-          for dir in packages/winternitz packages/xmss; do
-            name=$(jq -r '.name' "$dir/package.json")
-            v=$(jq -r '.version' "$dir/package.json")
-            if npm view "$name@$v" version >/dev/null 2>&1; then
-              echo "$name $v is already published to npm"
+          v="${GITHUB_REF_NAME#npm-v}"
+          v="${v#v}"
+          if npm view "@blueshift-gg/solana-winternitz@$v" version >/dev/null 2>&1; then
+            if [[ "${GITHUB_REF_NAME}" == npm-v* ]]; then
+              echo "::error::$v is already published to npm; pick a new version"
+              exit 1
             else
-              echo "$name $v will be published"
-              skip=false
+              echo "npm $v already published; skipping npm publish"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
-          done
-          if [[ "$skip" == true && "${GITHUB_REF_NAME}" == npm-v* ]]; then
-            echo "::error::every package version is already published to npm; pick new versions"
-            exit 1
           fi
-          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
 
   publish:
-    name: Publish npm packages
+    name: Publish npm package
     needs: check
     if: needs.check.outputs.skip != 'true'
     runs-on: ubuntu-latest
@@ -74,15 +71,6 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
-      # solana-winternitz first: solana-xmss depends on it.
-      - name: Publish npm packages
-        run: |
-          for dir in packages/winternitz packages/xmss; do
-            name=$(jq -r '.name' "$dir/package.json")
-            v=$(jq -r '.version' "$dir/package.json")
-            if npm view "$name@$v" version >/dev/null 2>&1; then
-              echo "$name $v already published; skipping"
-            else
-              (cd "$dir" && npm publish --access public)
-            fi
-          done
+      - name: Publish npm package
+        working-directory: packages/winternitz
+        run: npm publish --access public

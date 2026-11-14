@@ -1,16 +1,17 @@
-//! Register a public key, then verify and record used leaves in its account.
+//! Register a one-time public key, then verify one signature and spend the key.
 
 use solana_account_info::AccountInfo;
 use solana_program_entrypoint::entrypoint;
 use solana_program_error::{ProgramError, ProgramResult};
 use solana_pubkey::Pubkey;
-use solana_winternitz::{MESSAGE_LEN, PUBLIC_KEY_LEN};
+use solana_winternitz::{MESSAGE_LEN, PUBLIC_KEY_LEN, Signature, VerifyingKey};
 
 entrypoint!(process_instruction);
 
-const KEY_END: usize = 1 + PUBLIC_KEY_LEN;
-/// Instance tag, public key, and a 256-bit used-leaf bitmap.
-pub const KEY_ACCOUNT_LEN: usize = KEY_END + 32;
+/// State byte (0 empty, 1 registered, 2 spent), then the public key.
+pub const KEY_ACCOUNT_LEN: usize = 1 + PUBLIC_KEY_LEN;
+const REGISTERED: u8 = 1;
+const SPENT: u8 = 2;
 
 fn process_instruction(id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let account = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -24,71 +25,46 @@ fn process_instruction(id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         .split_first()
         .ok_or(ProgramError::InvalidInstructionData)?;
     match tag {
-        0 | 1 => create(account, tag, data),
-        2 => verify(account, data),
+        0 => create(account, data),
+        1 => verify(account, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
 
-// [0: Winternitz or 1: XMSS][public key: 41]. Allocate with the System Program first.
-fn create(account: &AccountInfo, tag: u8, data: &[u8]) -> ProgramResult {
+// [0][public key: 41]. Allocate with the System Program first.
+fn create(account: &AccountInfo, data: &[u8]) -> ProgramResult {
     if !account.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    // Both crates' keys are `node ‖ P`, 41 bytes.
-    let key = solana_winternitz::VerifyingKey::ref_from_bytes(data)
-        .map_err(|_| ProgramError::InvalidInstructionData)?;
+    let key =
+        VerifyingKey::ref_from_bytes(data).map_err(|_| ProgramError::InvalidInstructionData)?;
     let mut bytes = account.try_borrow_mut_data()?;
     if bytes[0] != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
-    bytes[0] = tag + 1;
-    bytes[1..KEY_END].copy_from_slice(key.as_bytes());
-    bytes[KEY_END..].fill(0);
+    bytes[0] = REGISTERED;
+    bytes[1..].copy_from_slice(key.as_bytes());
     Ok(())
 }
 
-// [2][digest: 32][signature: 849 or 1037]. The stored instance selects the encoding.
+// [1][digest: 32][signature: 849]. A key verifies once, then is spent.
 fn verify(account: &AccountInfo, data: &[u8]) -> ProgramResult {
     let (digest, signature) = data
         .split_first_chunk::<MESSAGE_LEN>()
         .ok_or(ProgramError::InvalidInstructionData)?;
+    let signature =
+        Signature::ref_from_bytes(signature).map_err(|_| ProgramError::InvalidInstructionData)?;
     let mut bytes = account.try_borrow_mut_data()?;
-    let key = &bytes[1..KEY_END];
-    let (leaf, result) = match bytes[0] {
+    match bytes[0] {
         0 => return Err(ProgramError::UninitializedAccount),
-        1 => (
-            0,
-            solana_winternitz::VerifyingKey::ref_from_bytes(key)
-                .map_err(|_| ProgramError::InvalidAccountData)?
-                .verify(
-                    digest,
-                    solana_winternitz::Signature::ref_from_bytes(signature)
-                        .map_err(|_| ProgramError::InvalidInstructionData)?,
-                )
-                .is_ok(),
-        ),
-        2 => {
-            let signature = solana_xmss::Signature::ref_from_bytes(signature)
-                .map_err(|_| ProgramError::InvalidInstructionData)?;
-            let key = solana_xmss::VerifyingKey::ref_from_bytes(key)
-                .map_err(|_| ProgramError::InvalidAccountData)?;
-            (
-                signature.leaf() as usize,
-                key.verify(digest, signature).is_ok(),
-            )
-        }
+        REGISTERED => {}
+        SPENT => return Err(ProgramError::Custom(2)),
         _ => return Err(ProgramError::InvalidAccountData),
-    };
-    // Verification checks the leaf bound before it is used to index the bitmap.
-    if !result {
-        return Err(ProgramError::Custom(1));
     }
-    let used = &mut bytes[KEY_END + leaf / 8];
-    let mask = 1 << (leaf % 8);
-    if *used & mask != 0 {
-        return Err(ProgramError::Custom(2));
-    }
-    *used |= mask;
+    VerifyingKey::ref_from_bytes(&bytes[1..])
+        .map_err(|_| ProgramError::InvalidAccountData)?
+        .verify(digest, signature)
+        .map_err(|_| ProgramError::Custom(1))?;
+    bytes[0] = SPENT;
     Ok(())
 }
