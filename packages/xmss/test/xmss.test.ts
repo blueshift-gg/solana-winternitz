@@ -12,7 +12,7 @@ import { type SigningErrorCode, SigningError, SigningKey } from '../src/signer.j
 import { SecretKey } from '../src/hazmat.js';
 import * as winternitz from '@blueshift-gg/solana-winternitz';
 import { SigningKey as OneTimeSigningKey } from '@blueshift-gg/solana-winternitz/signer';
-import { keccak_256 } from '@noble/hashes/sha3.js';
+import { leaf as committedLeaf } from '@blueshift-gg/solana-winternitz/primitives';
 
 function expectCode(action: () => unknown, code: ErrorCode | SigningErrorCode): void {
   let caught: unknown;
@@ -60,18 +60,16 @@ test.each(vectors.cases)('vector: $name', ({ message, signature, valid }) => {
 });
 
 // Deliberately non-random public inputs, matching the Rust fixture generator.
+/** Whether the salted digest meets the target sum (the leaf exists). */
+function accepts(salt: Uint8Array, parameter: Uint8Array, leaf: number, message: Uint8Array): boolean {
+  return committedLeaf(parameter, leaf, salt, new Uint8Array(828), message) !== undefined;
+}
+
 function acceptedSalt(parameter: Uint8Array, leaf: number, message: Uint8Array): Uint8Array {
-  const input = new Uint8Array(76);
-  input.set(parameter, 21);
-  input[39] = 2;
-  new DataView(input.buffer).setUint32(40, leaf, true);
-  input.set(message, 44);
+  const salt = new Uint8Array(21);
   for (let counter = 0; ; counter++) {
-    new DataView(input.buffer).setUint32(0, counter, true);
-    const hash = keccak_256(input);
-    let sum = 0;
-    for (const b of hash.subarray(0, 18)) sum += (b & 15) + (b >> 4);
-    if (sum === 297) return input.slice(0, 21);
+    new DataView(salt.buffer).setUint32(0, counter, true);
+    if (accepts(salt, parameter, leaf, message)) return salt;
   }
 }
 
@@ -196,16 +194,10 @@ test('entropy failure, salt exhaustion, and write failure release no signature',
     expect(signer.nextLeaf()).toBe(1);
     // One known rejected candidate repeated K times deterministically forces exhaustion.
     const bad = new Uint8Array(21);
-    const input = new Uint8Array(76);
-    input.set(signer.verifyingKey().toBytes().subarray(23), 21);
-    input[39] = 2;
-    new DataView(input.buffer).setUint32(40, 1, true);
-    input.set(m, 44);
+    const parameter = signer.verifyingKey().toBytes().subarray(23);
     for (let counter = 0; ; counter++) {
       new DataView(bad.buffer).setUint32(0, counter, true);
-      input.set(bad, 0);
-      const sum = keccak_256(input).subarray(0, 18).reduce((n, b) => n + (b & 15) + (b >> 4), 0);
-      if (sum !== 297) break;
+      if (!accepts(bad, parameter, 1, m)) break;
     }
     fill.mockImplementation(((buffer: Uint8Array) => { buffer.set(bad); return buffer; }) as typeof crypto.randomFillSync);
     expectCode(() => signer.sign(m), 'SaltsExhausted');
