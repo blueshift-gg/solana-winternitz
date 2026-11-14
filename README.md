@@ -18,7 +18,7 @@ Solana's `sol_keccak256` syscall.
 
 ```toml
 [dependencies]
-solana-winternitz = { git = "https://github.com/blueshift-gg/solana-winternitz" }
+solana-winternitz = "0.2.0"
 ```
 
 ```rust
@@ -100,3 +100,7 @@ Based on [DKKW25](https://eprint.iacr.org/2025/055) and
 [hash-sig](https://github.com/b-wagn/hash-sig/tree/e66a48565d73c4d83d54e1b28fe249ab8c0d8542),
 using Keccak-256, sampled chain starts and at most 256 leaves. Not compatible
 with RFC 8391 XMSS. Unaudited.
+
+Version 0.2 is a new scheme and is not compatible with the 0.1.x releases
+of this crate (224-bit Keccak Winternitz): keys, signatures and the API all
+differ.
