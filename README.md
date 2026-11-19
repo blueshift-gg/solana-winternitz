@@ -11,7 +11,7 @@ Winternitz over Keccak-256. Verification is `no_std` and uses Solana's
 
 | Crate | Max. signatures per key | Signature | Public key | Verify CU |
 |---|---:|---:|---:|---:|
-| `solana-winternitz` | 1 | 849 bytes | 41 bytes | ~34,800 |
+| `solana-winternitz` | 1 | 849 bytes | 41 bytes | ~33,400 |
 | [`solana-xmss`](https://github.com/blueshift-gg/solana-xmss) | 256 | 1,037 bytes | 41 bytes | ~36,500 |
 
 A one-time key must sign exactly one message: two signatures from the same
