@@ -89,34 +89,55 @@ pub(crate) fn encode(
 }
 
 /// Construction 2 over `Trunc_n(H(P ‖ t ‖ x))` (§7.2.2).
-/// One 48-byte buffer keeps each chain syscall to a single slice.
-pub(crate) struct Chain([u8; Chain::VALUE + ELEMENT_LEN]);
+/// Two buffers under one tweak prefix: a step hashes one into the digest slot
+/// of the other, so each chain syscall reads a single slice and the value is
+/// never copied.
+pub(crate) struct Chain([Buffer; 2]);
+
+/// A chain input and the digest it receives: `P ‖ tweak ‖ value ‖ 9 bytes`.
+type Buffer = [u8; Chain::VALUE + hash::HASH_LENGTH];
 
 impl Chain {
     const TWEAK: usize = PARAMETER_LEN;
     const INDEX: usize = Self::TWEAK + 5;
     const POSITION: usize = Self::TWEAK + 6;
     const VALUE: usize = Self::TWEAK + CHAIN_TWEAK_LENGTH;
+    const INPUT: usize = Self::VALUE + ELEMENT_LEN;
 
     pub(crate) fn new(parameter: &[u8], leaf: u32) -> Self {
-        let mut buf = [0u8; Self::VALUE + ELEMENT_LEN];
+        let mut buf: Buffer = [0; _];
         buf[..Self::TWEAK].copy_from_slice(parameter);
         buf[Self::TWEAK] = ROLE_CHAIN;
         buf[Self::TWEAK + 1..Self::INDEX].copy_from_slice(&leaf.to_be_bytes());
-        Self(buf)
+        Self([buf; 2])
     }
 
     /// The step entering position `k` uses tweak `k` (Construction 2).
     /// Lemma 2 permits splitting the walk at the signed position `x_i`.
+    /// Two steps per iteration keep each buffer's role, so nothing is swapped.
     pub(crate) fn walk(&mut self, i: u8, from: u8, to: u8, x: &[u8; ELEMENT_LEN]) -> Node {
-        self.0[Self::INDEX] = i;
-        self.0[Self::VALUE..].copy_from_slice(x);
-        for k in from..to {
-            self.0[Self::POSITION] = k + 1;
-            let h = hash::hashv(&[&self.0]);
-            self.0[Self::VALUE..].copy_from_slice(&h[..ELEMENT_LEN]);
+        let [a, b] = self.0.each_mut();
+        a[Self::INDEX] = i;
+        b[Self::INDEX] = i;
+        a[Self::VALUE..Self::INPUT].copy_from_slice(x);
+        let mut k = from;
+        while k + 1 < to {
+            Self::step(a, b, k + 1);
+            Self::step(b, a, k + 2);
+            k += 2;
         }
-        self.0[Self::VALUE..].try_into().unwrap()
+        if k < to {
+            Self::step(a, b, k + 1);
+            return b[Self::VALUE..Self::INPUT].try_into().unwrap();
+        }
+        a[Self::VALUE..Self::INPUT].try_into().unwrap()
+    }
+
+    /// `dst.value = Trunc_n(H(src))` with `src` at `position`.
+    #[inline(always)]
+    fn step(src: &mut Buffer, dst: &mut Buffer, position: u8) {
+        src[Self::POSITION] = position;
+        hash::hashv_into(&[&src[..Self::INPUT]], dst.last_chunk_mut().unwrap());
     }
 
     /// Construction 3 Ver step 6: each `σ_i` walked from `x_i` to `2^w − 1`.
